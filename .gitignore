@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables
+.env
+
+# Video and ML model files
+*.mp4
+*.avi
+*.mkv
+*.pt
+*.onnx
+weights/
+runs/
+yolov8n.pt
+
+# IDEs and OS
+.vscode/
+.idea/
+.DS_Store
