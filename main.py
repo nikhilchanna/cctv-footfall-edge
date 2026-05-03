@@ -8,6 +8,7 @@ from typing import List
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 
@@ -99,6 +100,18 @@ async def lifespan(app: FastAPI):
     logger.info("All CCTV Processors stopped.")
 
 app = FastAPI(title="Footfall Counter Service", version="1.0.0", lifespan=lifespan)
+
+app.mount("/media", StaticFiles(directory="."), name="media")
+
+from fastapi.responses import FileResponse
+
+@app.get("/stream_video", tags=["Media"])
+def stream_video(path: str):
+    """Serve any local video file by absolute path."""
+    import os
+    if os.path.exists(path):
+        return FileResponse(path, media_type="video/mp4")
+    raise HTTPException(status_code=404, detail="Video file not found")
 
 app.add_middleware(
     CORSMiddleware,
