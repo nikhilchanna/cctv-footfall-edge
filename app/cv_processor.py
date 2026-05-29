@@ -97,8 +97,17 @@ class CCTVProcessor(threading.Thread):
         cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
         
         if not cap.isOpened():
-            report_internal_error("CCTVProcessor", f"Cannot open stream {source} for CCTV {self.cctv_id}")
-            return
+            if not is_demo:
+                logger.error(f"Cannot open stream {source} for CCTV {self.cctv_id}. AUTOMATIC FALLBACK TO DEMO VIDEO.")
+                is_demo = True
+                source = "sample.mp4"
+                cap = cv2.VideoCapture(source)
+                if not cap.isOpened():
+                    report_internal_error("CCTVProcessor", f"Cannot open fallback stream sample.mp4")
+                    return
+            else:
+                report_internal_error("CCTVProcessor", f"Cannot open stream {source} for CCTV {self.cctv_id}")
+                return
 
         # Take a sample picture at the start of the feed
         import os
