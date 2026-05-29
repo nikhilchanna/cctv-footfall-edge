@@ -10,7 +10,7 @@ from app.schemas import ErrorReport
 logger = logging.getLogger(__name__)
 
 # Dummy external server URL. This should ideally come from CctvConfig or env var.
-EXTERNAL_API_URL = "http://localhost:8080/api/v1/footfall-data"
+EXTERNAL_API_URL = "http://localhost:8081/api/v1/footfall-data"
 
 def report_internal_error(source: str, error_msg: str, traceback_str: str = None):
     """Helper to log internal thread errors mimicking the error reporting API."""

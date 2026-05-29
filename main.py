@@ -103,7 +103,18 @@ app = FastAPI(title="Footfall Counter Service", version="1.0.0", lifespan=lifesp
 
 app.mount("/media", StaticFiles(directory="."), name="media")
 
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+import asyncio
+
+async def frame_generator(cctv_id: str):
+    while True:
+        processor = active_processors.get(cctv_id)
+        if processor and processor.last_frame:
+            with processor.lock:
+                frame_bytes = processor.last_frame
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        await asyncio.sleep(0.04) # Serve at ~25 FPS
 
 @app.get("/stream_video", tags=["Media"])
 def stream_video(path: str):
@@ -113,10 +124,29 @@ def stream_video(path: str):
         return FileResponse(path, media_type="video/mp4")
     raise HTTPException(status_code=404, detail="Video file not found")
 
+@app.get("/stream/{cctv_id}", tags=["Media"])
+def stream_cctv(cctv_id: str):
+    """MJPEG stream endpoint for real-time video preview with bounding boxes."""
+    if cctv_id not in active_processors:
+        if cctv_id == "demo":
+            logger.info("Auto-starting demo CCTV processor...")
+            processor = CCTVProcessor(
+                cctv_id="demo",
+                cctv_name="Demo Camera",
+                stream_url="demo",
+                line_coords={'x1': 0, 'y1': 200, 'x2': 640, 'y2': 200},
+                window_size=10
+            )
+            processor.start()
+            active_processors["demo"] = processor
+        else:
+            raise HTTPException(status_code=404, detail="CCTV Processor not found or not active")
+    return StreamingResponse(frame_generator(cctv_id), media_type="multipart/x-mixed-replace; boundary=frame")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -140,7 +170,7 @@ def report_error(error: schemas.ErrorReport):
 
 @app.post("/config", response_model=schemas.CctvConfigResponse, tags=["CCTV Configuration"])
 def update_cctv_config(config: schemas.CctvConfigCreate, db: Session = Depends(get_db)):
-    """Update or Create the CCTV JSON configuration."""
+    """Update or Create the CCTV JSON configuration and dynamically reload processors."""
     db_config = db.query(models.CctvConfig).first()
     if db_config:
         # Update existing
@@ -152,6 +182,33 @@ def update_cctv_config(config: schemas.CctvConfigCreate, db: Session = Depends(g
     
     db.commit()
     db.refresh(db_config)
+    
+    # Dynamically apply new configuration parameters to processors
+    try:
+        cameras = config.config_data.get("cameras", [])
+        for cam in cameras:
+            cam_id = cam.get("id")
+            # If processor is already running, stop it
+            if cam_id in active_processors:
+                logger.info(f"Stopping active CCTV processor {cam_id} for configuration update...")
+                active_processors[cam_id].stop()
+                active_processors[cam_id].join(timeout=2)
+                del active_processors[cam_id]
+            
+            # Start new processor with updated line_coords and rtsp_url
+            logger.info(f"Restarting CCTV processor {cam_id} with updated configurations...")
+            processor = CCTVProcessor(
+                cctv_id=cam_id,
+                cctv_name=cam.get("name"),
+                stream_url=cam.get("rtsp_url"),
+                line_coords=cam.get("line_coords", {'x1': 0, 'y1': 200, 'x2': 640, 'y2': 200}),
+                window_size=cam.get("window_size", 10)
+            )
+            processor.start()
+            active_processors[cam_id] = processor
+    except Exception as e:
+        logger.error(f"Failed to dynamically apply updated configuration: {e}")
+        
     return db_config
 
 @app.get("/config", response_model=schemas.CctvConfigResponse, tags=["CCTV Configuration"])

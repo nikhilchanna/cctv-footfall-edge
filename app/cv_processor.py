@@ -38,6 +38,10 @@ class CCTVProcessor(threading.Thread):
         self.ctr_in = 0
         self.ctr_out = 0
         self.window_start_time = datetime.now(timezone.utc)
+        
+        # Live streaming frame cache
+        self.last_frame = None
+        self.lock = threading.Lock()
 
     def is_crossing_line(self, pt1, pt2, line_pt1, line_pt2):
         """
@@ -86,10 +90,14 @@ class CCTVProcessor(threading.Thread):
 
     def run(self):
         logger.info(f"Starting CCTV Processor for {self.cctv_id} ({self.cctv_name})")
-        cap = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG)
+        
+        # Check if running in demo mode
+        is_demo = self.stream_url == "demo"
+        source = "sample.mp4" if is_demo else self.stream_url
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
         
         if not cap.isOpened():
-            report_internal_error("CCTVProcessor", f"Cannot open stream {self.stream_url} for CCTV {self.cctv_id}")
+            report_internal_error("CCTVProcessor", f"Cannot open stream {source} for CCTV {self.cctv_id}")
             return
 
         # Take a sample picture at the start of the feed
@@ -106,16 +114,20 @@ class CCTVProcessor(threading.Thread):
             cv2.imwrite(snapshot_path, frame)
             logger.info(f"Saved initial snapshot for {self.cctv_id} to {snapshot_path}")
 
-        l_pt1 = (self.line_coords.get('x1', 0), self.line_coords.get('y1', 0))
-        l_pt2 = (self.line_coords.get('x2', 640), self.line_coords.get('y2', 0))
+        l_pt1 = (self.line_coords.get('x1', 0), self.line_coords.get('y1', 200))
+        l_pt2 = (self.line_coords.get('x2', 640), self.line_coords.get('y2', 200))
 
         while self.running:
-            # Buffer clearing: Grab frames without decoding to stay real-time
-            if cap.get(cv2.CAP_PROP_BUFFERSIZE) > 0:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Some backends support this to clear buffer
+            # Buffer clearing: Grab frames without decoding to stay real-time (skip for demo file)
+            if not is_demo and cap.get(cv2.CAP_PROP_BUFFERSIZE) > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
             ret, frame = cap.read()
             if not ret or frame is None:
+                if is_demo:
+                    # Loop the demo video
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
                 logger.warning(f"Failed to read frame from {self.cctv_id}. Reconnecting...")
                 time.sleep(2)
                 cap.release()
@@ -161,6 +173,10 @@ class CCTVProcessor(threading.Thread):
                 center_y = int((ltrb[1] + ltrb[3]) / 2)
                 current_pt = (center_x, center_y)
                 
+                # Draw bounding box and label
+                cv2.rectangle(frame, (int(ltrb[0]), int(ltrb[1])), (int(ltrb[2]), int(ltrb[3])), (0, 255, 0), 2)
+                cv2.putText(frame, f"ID: {track_id}", (int(ltrb[0]), int(ltrb[1]) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                
                 if track_id in self.track_history:
                     prev_pt = self.track_history[track_id]
                     
@@ -168,17 +184,29 @@ class CCTVProcessor(threading.Thread):
                     direction = self.is_crossing_line(prev_pt, current_pt, l_pt1, l_pt2)
                     if direction == 1:
                         self.ctr_in += 1
-                        logger.debug(f"[{self.cctv_id}] Person crossed IN")
+                        logger.info(f"[{self.cctv_id}] Person crossed IN")
                         # Clear history to avoid double counting
                         del self.track_history[track_id]
                         continue
                     elif direction == -1:
                         self.ctr_out += 1
-                        logger.debug(f"[{self.cctv_id}] Person crossed OUT")
+                        logger.info(f"[{self.cctv_id}] Person crossed OUT")
                         del self.track_history[track_id]
                         continue
                         
                 self.track_history[track_id] = current_pt
+            
+            # Draw customizable horizontal/vertical counting line
+            cv2.line(frame, l_pt1, l_pt2, (255, 0, 0), 3) # Blue line
+            
+            # Draw real-time totals overlay on stream (highly visual for POC)
+            cv2.putText(frame, f"IN: {self.ctr_in} | OUT: {self.ctr_out}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            
+            # Save the processed frame to thread-safe last_frame cache for streaming
+            ret_enc, jpeg_bytes = cv2.imencode('.jpg', frame)
+            if ret_enc:
+                with self.lock:
+                    self.last_frame = jpeg_bytes.tobytes()
                 
         cap.release()
         logger.info(f"Stopped CCTV Processor for {self.cctv_id}")
