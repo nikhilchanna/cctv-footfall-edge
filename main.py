@@ -232,3 +232,110 @@ def get_total_counts(cctv_id: str, db: Session = Depends(get_db)):
         "total_in": totals.total_in or 0,
         "total_out": totals.total_out or 0
     }
+
+from pydantic import BaseModel
+import requests
+from requests.auth import HTTPDigestAuth
+from urllib.parse import quote
+
+class DvrConnectRequest(BaseModel):
+    ip: str
+    username: str
+    password: str
+
+@app.post("/dvr/connect", tags=["DVR HMI"])
+def connect_dvr(req: DvrConnectRequest):
+    """Validate Hikvision DVR connection via ISAPI and auto-populate available camera channels."""
+    if req.ip == "demo":
+        logger.info("Initializing simulated demo DVR channels...")
+        return {
+            "success": True,
+            "cameras": [
+                {
+                    "camera_name": "Demo Entrance Camera",
+                    "camera_number": 1,
+                    "channel_id": "demo",
+                    "rtsp": "demo"
+                }
+            ]
+        }
+
+    try:
+        logger.info(f"Authenticating with Hikvision DVR via ISAPI: {req.ip}")
+        # Validate connection using Hikvision's ISAPI deviceInfo
+        response = requests.get(
+            f"http://{req.ip}/ISAPI/System/deviceInfo",
+            auth=HTTPDigestAuth(req.username, req.password),
+            timeout=5,
+            verify=False
+        )
+        
+        if response.status_code != 200:
+            logger.warning(f"Hikvision authentication failed for {req.ip}: status {response.status_code}")
+            return {
+                "success": False,
+                "detail": f"DVR authentication failed with status code {response.status_code}"
+            }
+            
+        # Discover dynamically from ISAPI
+        xml_response = requests.get(
+            f"http://{req.ip}/ISAPI/Streaming/channels",
+            auth=HTTPDigestAuth(req.username, req.password),
+            timeout=5,
+            verify=False
+        )
+        
+        cameras = []
+        encoded_password = quote(req.password)
+        
+        if xml_response.status_code == 200:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(xml_response.content)
+            namespace = ""
+            if "xmlns" in root.tag:
+                namespace = root.tag.split('}')[0] + '}'
+                
+            for channel in root.findall(f".//{namespace}StreamingChannel"):
+                id_elem = channel.find(f"{namespace}id")
+                name_elem = channel.find(f"{namespace}channelName")
+                if id_elem is not None:
+                    channel_id = id_elem.text
+                    
+                    # We prefer Substreams (channel ID ending in '02' or '2') to save bandwidth
+                    # but we will return whatever Hikvision provides.
+                    name = name_elem.text if name_elem is not None else f"Camera {channel_id}"
+                    
+                    # LIVE stream path is /Streaming/Channels/, not /tracks/ (which is playback)
+                    rtsp_url = f"rtsp://{req.username}:{encoded_password}@{req.ip}:554/Streaming/Channels/{channel_id}"
+                    
+                    cameras.append({
+                        "camera_name": name,
+                        "camera_number": len(cameras) + 1,
+                        "channel_id": channel_id,
+                        "rtsp": rtsp_url
+                    })
+        
+        # Fallback if XML fails
+        if not cameras:
+            logger.warning("Dynamic XML parsing failed or empty, falling back to 16-channel generation.")
+            for cam_no in range(1, 17):
+                channel_id = f"{cam_no}02"
+                rtsp_url = f"rtsp://{req.username}:{encoded_password}@{req.ip}:554/Streaming/Channels/{channel_id}"
+                cameras.append({
+                    "camera_name": f"DVR Camera {cam_no}",
+                    "camera_number": cam_no,
+                    "channel_id": channel_id,
+                    "rtsp": rtsp_url
+                })
+            
+        logger.info(f"Successfully auto-discovered {len(cameras)} Hikvision DVR channels!")
+        return {
+            "success": True,
+            "cameras": cameras
+        }
+    except Exception as e:
+        logger.error(f"Failed to auto-discover DVR channels: {e}")
+        return {
+            "success": False,
+            "detail": f"Failed to connect to DVR: {str(e)}"
+        }

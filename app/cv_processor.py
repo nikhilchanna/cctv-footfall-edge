@@ -2,6 +2,8 @@ import cv2
 import threading
 import time
 import logging
+import subprocess
+import numpy as np
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from deep_sort_realtime.deepsort_tracker import DeepSort
@@ -15,6 +17,153 @@ from app.models import DataTracker
 from app.tasks import report_internal_error
 
 logger = logging.getLogger(__name__)
+
+class FFmpegVideoCapture:
+    """
+    High-performance bufferless capture wrapper.
+    For local files: Uses standard OpenCV VideoCapture.
+    For live RTSP feeds: Spawns an FFMPEG subprocess with low-latency flags, 
+    pipes MJPEG stream to stdout, and decodes JPEGs in a background thread.
+    """
+    def __init__(self, src, fps=5):
+        self.src = src
+        self.fps = fps
+        self.ret = False
+        self.frame = None
+        self.running = True
+        self.lock = threading.Lock()
+        
+        # Check if source is a local video file or RTSP stream
+        self.is_file = src == "sample.mp4" or not (src.startswith("rtsp://") or src.startswith("http://"))
+        
+        if self.is_file:
+            self.cap = cv2.VideoCapture(src)
+            self.thread = threading.Thread(target=self._file_reader)
+        else:
+            self.cap = None
+            self.last_frame_time = time.time()
+            self.thread = threading.Thread(target=self._rtsp_reader)
+            
+        self.thread.daemon = True
+        self.thread.start()
+
+    def _file_reader(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                if self.src == "sample.mp4":
+                    # Loop the demo video file
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    time.sleep(0.01)
+                    continue
+                else:
+                    logger.warning(f"Stream connection lost: {self.src}. Reconnecting...")
+                    time.sleep(2)
+                    self.cap.release()
+                    self.cap = cv2.VideoCapture(self.src)
+                    continue
+            with self.lock:
+                self.ret = ret
+                self.frame = frame
+            time.sleep(1.0 / self.fps)
+
+    def _rtsp_reader(self):
+        # Ultra low latency FFMPEG decoding pipe flags
+        command = [
+            "ffmpeg",
+            "-rtsp_transport", "tcp",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-i", self.src,
+            "-an",
+            "-vf", f"fps={self.fps},scale=960:-1",
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "-q:v", "5",
+            "-"
+        ]
+        
+        while self.running:
+            logger.info(f"Spawning FFMPEG pipe decoder for RTSP stream: {self.src}")
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=10**8
+                )
+            except FileNotFoundError:
+                logger.error("ffmpeg executable not found in PATH! Falling back to OpenCV native RTSP capture.")
+                self.cap = cv2.VideoCapture(self.src)
+                self._file_reader()
+                return
+            
+            buffer = b""
+            while self.running and process.poll() is None:
+                try:
+                    chunk = process.stdout.read(4096)
+                    if not chunk:
+                        time.sleep(0.01)
+                        continue
+                    buffer += chunk
+                    
+                    while True:
+                        start = buffer.find(b'\xff\xd8') # JPEG Header
+                        end = buffer.find(b'\xff\xd9')   # JPEG Footer
+                        if start != -1 and end != -1:
+                            if start < end:
+                                jpg_bytes = buffer[start:end+2]
+                                buffer = buffer[end+2:]
+                                
+                                # Decode JPEG directly to numpy array
+                                nparr = np.frombuffer(jpg_bytes, np.uint8)
+                                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                                if frame is not None:
+                                    with self.lock:
+                                        self.ret = True
+                                        self.frame = frame
+                                        self.last_frame_time = time.time()
+                            else:
+                                # Invalid sequence, skip buffer up to header
+                                buffer = buffer[start:]
+                        else:
+                            break
+                except Exception as e:
+                    logger.error(f"FFmpeg subprocess read error: {e}")
+                    break
+                    
+            try:
+                process.kill()
+                process.wait(timeout=1)
+            except:
+                pass
+            
+            if self.running:
+                logger.warning("FFmpeg subprocess stream disconnected. Reconnecting in 2 seconds...")
+                time.sleep(2)
+
+    def read(self):
+        with self.lock:
+            if self.frame is not None:
+                return self.ret, self.frame.copy()
+            return self.ret, None
+            
+    def get_last_frame_time(self):
+        with self.lock:
+            return getattr(self, 'last_frame_time', time.time())
+
+    def release(self):
+        self.running = False
+        if self.cap:
+            self.cap.release()
+        self.thread.join(timeout=1)
+
+    def isOpened(self):
+        if self.is_file:
+            return self.cap.isOpened()
+        # For live stream, return True and let FFMPEG thread handle connection
+        return True
+
 
 class CCTVProcessor(threading.Thread):
     def __init__(self, cctv_id: str, cctv_name: str, stream_url: str, line_coords: dict, window_size: int = 10):
@@ -94,14 +243,15 @@ class CCTVProcessor(threading.Thread):
         # Check if running in demo mode
         is_demo = self.stream_url == "demo"
         source = "sample.mp4" if is_demo else self.stream_url
-        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+        
+        cap = FFmpegVideoCapture(source)
         
         if not cap.isOpened():
             if not is_demo:
                 logger.error(f"Cannot open stream {source} for CCTV {self.cctv_id}. AUTOMATIC FALLBACK TO DEMO VIDEO.")
                 is_demo = True
                 source = "sample.mp4"
-                cap = cv2.VideoCapture(source)
+                cap = FFmpegVideoCapture(source)
                 if not cap.isOpened():
                     report_internal_error("CCTVProcessor", f"Cannot open fallback stream sample.mp4")
                     return
@@ -113,12 +263,11 @@ class CCTVProcessor(threading.Thread):
         import os
         os.makedirs("snapshots", exist_ok=True)
         
-        # Clear buffer to get a fresh frame
-        for _ in range(5):
-            cap.grab()
+        # Wait a short moment for background thread to load first frame
+        time.sleep(0.5)
             
         ret, frame = cap.read()
-        if ret:
+        if ret and frame is not None:
             snapshot_path = os.path.join("snapshots", f"snapshot_{self.cctv_id}.jpg")
             cv2.imwrite(snapshot_path, frame)
             logger.info(f"Saved initial snapshot for {self.cctv_id} to {snapshot_path}")
@@ -127,20 +276,24 @@ class CCTVProcessor(threading.Thread):
         l_pt2 = (self.line_coords.get('x2', 640), self.line_coords.get('y2', 200))
 
         while self.running:
-            # Buffer clearing: Grab frames without decoding to stay real-time (skip for demo file)
-            if not is_demo and cap.get(cv2.CAP_PROP_BUFFERSIZE) > 0:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
             ret, frame = cap.read()
+            
+            # Stale stream guardrail
+            if not is_demo and not getattr(cap, 'is_file', True):
+                if time.time() - cap.get_last_frame_time() > 5.0:
+                    logger.warning(f"[{self.cctv_id}] Stale stream detected (no data for 5s). Reconnecting...")
+                    cap.release()
+                    cap = FFmpegVideoCapture(self.stream_url)
+                    continue
+
             if not ret or frame is None:
                 if is_demo:
-                    # Loop the demo video
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    time.sleep(0.04)
                     continue
                 logger.warning(f"Failed to read frame from {self.cctv_id}. Reconnecting...")
                 time.sleep(2)
                 cap.release()
-                cap = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG)
+                cap = FFmpegVideoCapture(self.stream_url)
                 continue
                 
             current_time = datetime.now(timezone.utc)
