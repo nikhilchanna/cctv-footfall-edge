@@ -1,4 +1,4 @@
-# How to Test the Footfall Counter Project Locally
+# How to Test the Footfall Counter Project Locally.
 
 Follow these step-by-step instructions to start the project and test the YOLOv8 + DeepSORT computer vision pipeline using a local sample video instead of an actual CCTV stream.
 
