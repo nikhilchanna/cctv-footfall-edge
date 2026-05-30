@@ -8,10 +8,15 @@ from app.models import DataTracker
 from app.peak_upload import peak_upload_job
 from app.error_reporting import report_internal_error
 
+import os
+
 logger = logging.getLogger(__name__)
 
-# Dummy external server URL. This should ideally come from CctvConfig or env var.
-EXTERNAL_API_URL = "http://localhost:8081/api/v1/footfall-data"
+# External server URL for sending footfall data (configurable via environment variable)
+EXTERNAL_API_URL = os.getenv(
+    "EXTERNAL_API_URL",
+    "http://localhost:8081/api/v1/footfall-data",
+)
 
 
 def api_calling_thread_job():
