@@ -88,3 +88,55 @@ Watch your terminal where Uvicorn is running.
 2. Check the `data_tracker_table`. You will see rows populated with your `ctr_in` and `ctr_out` for `CAM_001`.
 3. Check the `data_to_server_ack` column. The background API Calling thread will try to send this data to the external server. Because the external server is currently a dummy URL, it will mark the rows as `Failed`.
 4. The `Retry Failed Thread` will periodically wake up, find those failed entries, and retry them, incrementing the `api_call_ctr` each time!
+
+---
+
+### Hikvision ISAPI snapshot mode (production DVR)
+
+For Hikvision DVRs, analytics ingestion uses ISAPI JPEG snapshots instead of RTSP:
+
+- Endpoint: `GET /ISAPI/Streaming/channels/{channel_id}/picture`
+- Default poll rate: **7 FPS** on substream channel (`102` instead of `101`)
+- Footfall counting (YOLO + DeepSORT + 10s windows → `data_tracker_table` → POST to footfall-server) is unchanged
+- One peak JPEG per minute is stored in `minute_peak_snapshot` (highest people count in that minute)
+- Resume watermark is stored in `processing_cursor` (application-level, not provided by Hikvision)
+- On restart: footfall counts resume live (gap accepted); minute peaks may be backfilled via NVR `ContentMgmt` APIs
+
+Example camera config:
+
+```json
+{
+  "config_data": {
+    "dvr": { "ip": "192.168.1.34", "username": "admin", "password": "secret" },
+    "cameras": [{
+      "id": "101",
+      "name": "Camera 1",
+      "source_type": "isapi",
+      "channel_id": "102",
+      "poll_fps": 7,
+      "line_coords": { "x1": 0, "y1": 300, "x2": 1000, "y2": 300 },
+      "window_size": 10
+    }]
+  }
+}
+```
+
+Processor status API: `GET /processor/{cctv_id}/status`
+
+### Analytics UI, peaks, and edge dashboard
+
+- `GET /processor/{cctv_id}/thumbnail` — JPEG snapshot tile (refresh every few seconds in UI)
+- `GET /processor/{cctv_id}/minute-peaks?limit=15` — recent peak images on edge
+- `GET /cameras/status` — persisted camera alerts (`configured`, `connected`, `no_data`, `auth_failed`, …)
+- `GET /analytics/summary` — per-camera counts for lightweight UI
+- Edge HTML dashboard: `http://<host>:8000/edge-ui/`
+- Peak images upload to server every 20s (`PEAK_UPLOAD_URL`, default `http://localhost:8081/api/v1/peak-images`)
+- After upload, edge keeps at most **15 successful uploads per camera** (older files removed)
+
+New DB columns/tables (`camera_status`, peak upload fields): restart edge after deploy; for existing Postgres run:
+
+```sql
+ALTER TABLE minute_peak_snapshot ADD COLUMN IF NOT EXISTS uploaded_to_server VARCHAR DEFAULT 'Pending';
+ALTER TABLE minute_peak_snapshot ADD COLUMN IF NOT EXISTS server_path VARCHAR;
+ALTER TABLE minute_peak_snapshot ADD COLUMN IF NOT EXISTS uploaded_at TIMESTAMPTZ;
+```

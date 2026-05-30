@@ -5,17 +5,14 @@ import pytz
 from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.models import DataTracker
-from app.schemas import ErrorReport
+from app.peak_upload import peak_upload_job
+from app.error_reporting import report_internal_error
 
 logger = logging.getLogger(__name__)
 
 # Dummy external server URL. This should ideally come from CctvConfig or env var.
 EXTERNAL_API_URL = "http://localhost:8081/api/v1/footfall-data"
 
-def report_internal_error(source: str, error_msg: str, traceback_str: str = None):
-    """Helper to log internal thread errors mimicking the error reporting API."""
-    logger.error(f"Error from {source}: {error_msg} | Traceback: {traceback_str}")
-    # In a real scenario, could also POST to the FastAPI app itself if needed
 
 def api_calling_thread_job():
     """Reads 10 Pending entries, marks In-progress, sends to API, updates status."""

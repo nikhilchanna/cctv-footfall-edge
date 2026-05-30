@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Edge Footfall</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; background: #0f172a; color: #e2e8f0; }
+    h1 { font-size: 1.25rem; margin-bottom: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    th, td { border: 1px solid #334155; padding: 8px 10px; text-align: left; }
+    th { background: #1e293b; }
+    tr:nth-child(even) { background: #111827; }
+    .ok { color: #4ade80; }
+    .warn { color: #fbbf24; }
+    .err { color: #f87171; }
+    #updated { font-size: 0.75rem; color: #94a3b8; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Edge camera counts</h1>
+  <table>
+    <thead>
+      <tr>
+        <th>Camera</th>
+        <th>Status</th>
+        <th>Total IN</th>
+        <th>Total OUT</th>
+        <th>Window IN</th>
+        <th>Window OUT</th>
+        <th>Active</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p id="updated"></p>
+  <script>
+    const host = location.hostname;
+    const statusClass = (s) => {
+      if (s === 'connected' || s === 'configured') return 'ok';
+      if (s === 'no_data' || s === 'disconnected') return 'warn';
+      return 'err';
+    };
+    async function refresh() {
+      try {
+        const res = await fetch(`http://${host}:8000/analytics/summary`);
+        const data = await res.json();
+        const tbody = document.getElementById('rows');
+        tbody.innerHTML = data.map((r) => `
+          <tr>
+            <td>${r.cctvname || r.cctvid}</td>
+            <td class="${statusClass(r.status)}">${r.status}${r.message ? ' — ' + r.message : ''}</td>
+            <td>${r.total_in}</td>
+            <td>${r.total_out}</td>
+            <td>${r.window_in}</td>
+            <td>${r.window_out}</td>
+            <td>${r.processor_active ? 'yes' : 'no'}</td>
+          </tr>`).join('');
+        document.getElementById('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+      } catch (e) {
+        document.getElementById('updated').textContent = 'Error: ' + e.message;
+      }
+    }
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

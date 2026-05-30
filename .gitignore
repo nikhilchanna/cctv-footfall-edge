@@ -26,3 +26,5 @@ yolov8n.pt
 .vscode/
 .idea/
 .DS_Store
+
+*.jpg

@@ -18,6 +18,10 @@ import app.schemas as schemas
 import app.tasks as tasks
 from app.cv_processor import CCTVProcessor
 from app import hikvision_preview
+from app.hikvision_snapshot import substream_channel_id
+from app import hikvision_playback
+from app.camera_status import sync_configured_cameras, upsert_camera_status
+from app.peak_upload import peak_upload_job
 import logging
 
 # Set up a basic logger for error reporting
@@ -27,6 +31,82 @@ logger = logging.getLogger(__name__)
 # Dictionary to hold running CCTV processors
 active_processors = {}
 _suspended_for_preview: list = []
+
+
+def _get_config_record(db: Session):
+    return db.query(models.CctvConfig).first()
+
+
+def _get_dvr_config(db: Session) -> dict:
+    record = _get_config_record(db)
+    if record and record.config_data:
+        return record.config_data.get("dvr", {})
+    return {}
+
+
+def _persist_dvr_credentials(db: Session, ip: str, username: str, password: str):
+    record = _get_config_record(db)
+    config_data = dict(record.config_data) if record and record.config_data else {}
+    config_data["dvr"] = {"ip": ip, "username": username, "password": password}
+    if record:
+        record.config_data = config_data
+    else:
+        record = models.CctvConfig(config_data=config_data)
+        db.add(record)
+    db.commit()
+
+
+def _build_source_config(cam: dict) -> dict:
+    source_type = cam.get("source_type")
+    if not source_type:
+        rtsp = cam.get("rtsp_url") or cam.get("rtsp")
+        if rtsp == "demo":
+            source_type = "demo"
+        elif rtsp and (str(rtsp).startswith("rtsp://") or str(rtsp).startswith("http://")):
+            source_type = "rtsp"
+        else:
+            source_type = "isapi"
+
+    channel_id = cam.get("channel_id") or cam.get("id")
+    if source_type == "isapi" and channel_id and str(channel_id).endswith("01"):
+        channel_id = substream_channel_id(str(channel_id))
+
+    channel_num = cam.get("channel")
+    if channel_num is None and channel_id and str(channel_id).isdigit():
+        channel_num = int(str(channel_id)) // 100
+
+    return {
+        "type": source_type,
+        "channel_id": channel_id,
+        "poll_fps": cam.get("poll_fps", 7),
+        "channel": channel_num or 1,
+        "stream_type": cam.get("stream_type", 2),
+    }
+
+
+def _start_processor(cam: dict, dvr_config: dict) -> CCTVProcessor:
+    source_config = _build_source_config(cam)
+    processor = CCTVProcessor(
+        cctv_id=cam.get("id"),
+        cctv_name=cam.get("name"),
+        line_coords=cam.get("line_coords", {"x1": 0, "y1": 200, "x2": 640, "y2": 200}),
+        window_size=cam.get("window_size", 10),
+        stream_url=cam.get("rtsp_url") or cam.get("rtsp") or "demo",
+        source_config=source_config,
+        dvr_config=dvr_config,
+    )
+    processor.start()
+    return processor
+
+
+def _maybe_schedule_backfill(cam: dict, dvr_config: dict):
+    source_config = _build_source_config(cam)
+    if source_config.get("type") != "isapi" or not dvr_config.get("ip"):
+        return
+    channel_id = source_config.get("channel_id") or cam.get("id")
+    hikvision_playback.schedule_backfill_if_needed(
+        cam.get("id"), channel_id, dvr_config
+    )
 
 
 def _suspend_processors_for_dvr_preview(db: Session):
@@ -62,17 +142,8 @@ def _resume_processors_after_dvr_preview():
             continue
 
         logger.info("Resuming CCTV processor %s after DVR preview", cam_id)
-        processor = CCTVProcessor(
-            cctv_id=cam_id,
-            cctv_name=cam.get("name"),
-            stream_url=cam.get("rtsp_url"),
-            line_coords=cam.get(
-                "line_coords",
-                {"x1": 0, "y1": 200, "x2": 640, "y2": 200},
-            ),
-            window_size=cam.get("window_size", 10),
-        )
-        processor.start()
+        dvr_config = _get_dvr_config(SessionLocal())
+        processor = _start_processor(cam, dvr_config)
         active_processors[cam_id] = processor
 
     _suspended_for_preview = []
@@ -111,6 +182,14 @@ async def lifespan(app: FastAPI):
         name="Daily Cleanup Thread",
         replace_existing=True
     )
+
+    scheduler.add_job(
+        peak_upload_job,
+        trigger=IntervalTrigger(seconds=20),
+        id="peak_upload_thread",
+        name="Peak Image Upload Thread",
+        replace_existing=True
+    )
     
     scheduler.start()
     logger.info("Background jobs scheduled.")
@@ -121,18 +200,15 @@ async def lifespan(app: FastAPI):
         config_record = db.query(models.CctvConfig).first()
         if config_record and config_record.config_data:
             cameras = config_record.config_data.get("cameras", [])
+            dvr_config = config_record.config_data.get("dvr", {})
             for cam in cameras:
                 cam_id = cam.get("id")
-                processor = CCTVProcessor(
-                    cctv_id=cam_id,
-                    cctv_name=cam.get("name"),
-                    stream_url=cam.get("rtsp_url"),
-                    line_coords=cam.get("line_coords", {'x1': 0, 'y1': 200, 'x2': 640, 'y2': 200}),
-                    window_size=cam.get("window_size", 10)
-                )
-                processor.start()
+                processor = _start_processor(cam, dvr_config)
                 active_processors[cam_id] = processor
+                _maybe_schedule_backfill(cam, dvr_config)
             logger.info(f"Started {len(active_processors)} CCTV Processors.")
+            if cameras:
+                sync_configured_cameras(cameras, db=db)
     except Exception as e:
         logger.error(f"Failed to start CCTV Processors: {e}")
     finally:
@@ -157,18 +233,27 @@ app = FastAPI(title="Footfall Counter Service", version="1.0.0", lifespan=lifesp
 
 app.mount("/media", StaticFiles(directory="."), name="media")
 
+_static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(_static_dir):
+    app.mount("/edge-ui", StaticFiles(directory=_static_dir, html=True), name="edge-ui")
+
 from fastapi.responses import FileResponse, StreamingResponse, Response
 import asyncio
 
 async def frame_generator(cctv_id: str):
     while True:
         processor = active_processors.get(cctv_id)
-        if processor and processor.last_frame:
-            with processor.lock:
-                frame_bytes = processor.last_frame
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        await asyncio.sleep(0.04) # Serve at ~25 FPS
+        interval = 1.0 / 7
+        if processor:
+            interval = processor.get_stream_interval()
+            if processor.last_frame:
+                with processor.lock:
+                    frame_bytes = processor.last_frame
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
+                )
+        await asyncio.sleep(interval)
 
 @app.get("/stream_video", tags=["Media"])
 def stream_video(path: str):
@@ -187,9 +272,10 @@ def stream_cctv(cctv_id: str):
             processor = CCTVProcessor(
                 cctv_id="demo",
                 cctv_name="Demo Camera",
+                line_coords={"x1": 0, "y1": 200, "x2": 640, "y2": 200},
+                window_size=10,
                 stream_url="demo",
-                line_coords={'x1': 0, 'y1': 200, 'x2': 640, 'y2': 200},
-                window_size=10
+                source_config={"type": "demo"},
             )
             processor.start()
             active_processors["demo"] = processor
@@ -236,6 +322,12 @@ def update_cctv_config(config: schemas.CctvConfigCreate, db: Session = Depends(g
     
     db.commit()
     db.refresh(db_config)
+
+    cameras = config.config_data.get("cameras", [])
+    try:
+        sync_configured_cameras(cameras, db=db)
+    except Exception as e:
+        logger.warning("Failed to sync camera status rows: %s", e)
     
     # Dynamically apply new configuration parameters to processors
     try:
@@ -243,28 +335,19 @@ def update_cctv_config(config: schemas.CctvConfigCreate, db: Session = Depends(g
 
         hikvision_preview.stop_preview()
         _suspended_for_preview = []
-
-        cameras = config.config_data.get("cameras", [])
+        dvr_config = config.config_data.get("dvr", {})
         for cam in cameras:
             cam_id = cam.get("id")
-            # If processor is already running, stop it
             if cam_id in active_processors:
                 logger.info(f"Stopping active CCTV processor {cam_id} for configuration update...")
                 active_processors[cam_id].stop()
                 active_processors[cam_id].join(timeout=2)
                 del active_processors[cam_id]
-            
-            # Start new processor with updated line_coords and rtsp_url
+
             logger.info(f"Restarting CCTV processor {cam_id} with updated configurations...")
-            processor = CCTVProcessor(
-                cctv_id=cam_id,
-                cctv_name=cam.get("name"),
-                stream_url=cam.get("rtsp_url"),
-                line_coords=cam.get("line_coords", {'x1': 0, 'y1': 200, 'x2': 640, 'y2': 200}),
-                window_size=cam.get("window_size", 10)
-            )
-            processor.start()
+            processor = _start_processor(cam, dvr_config)
             active_processors[cam_id] = processor
+            _maybe_schedule_backfill(cam, dvr_config)
     except Exception as e:
         logger.error(f"Failed to dynamically apply updated configuration: {e}")
         
@@ -291,6 +374,106 @@ def get_total_counts(cctv_id: str, db: Session = Depends(get_db)):
         "total_in": totals.total_in or 0,
         "total_out": totals.total_out or 0
     }
+
+
+@app.get("/processor/{cctv_id}/status", response_model=schemas.ProcessorStatusResponse, tags=["Analytics"])
+def get_processor_status(cctv_id: str):
+    processor = active_processors.get(cctv_id)
+    if not processor:
+        raise HTTPException(status_code=404, detail="CCTV Processor not found or not active")
+    return processor.get_status()
+
+
+@app.get("/processor/{cctv_id}/minute-peaks", tags=["Analytics"])
+def get_minute_peaks(cctv_id: str, limit: int = 15, db: Session = Depends(get_db)):
+    """Recent peak images for UI (newest first, up to 15)."""
+    rows = (
+        db.query(models.MinutePeakSnapshot)
+        .filter(models.MinutePeakSnapshot.cctvid == cctv_id)
+        .order_by(models.MinutePeakSnapshot.captured_at.desc().nullslast())
+        .limit(min(limit, 15))
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "minute_bucket": row.minute_bucket.isoformat() if row.minute_bucket else None,
+            "people_count": row.people_count,
+            "image_path": row.image_path,
+            "source": row.source,
+            "uploaded_to_server": row.uploaded_to_server,
+            "uploaded_at": row.uploaded_at.isoformat() if row.uploaded_at else None,
+            "server_path": row.server_path,
+        }
+        for row in rows
+    ]
+
+
+@app.get("/processor/{cctv_id}/thumbnail", tags=["Analytics"])
+def get_processor_thumbnail(cctv_id: str):
+    """Latest annotated frame as JPEG (for Analytics tiles, not MJPEG)."""
+    processor = active_processors.get(cctv_id)
+    if processor and processor.last_frame:
+        with processor.lock:
+            return Response(
+                processor.last_frame,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "no-store"},
+            )
+    snapshot_path = os.path.join("snapshots", f"snapshot_{cctv_id}.jpg")
+    if os.path.isfile(snapshot_path):
+        return FileResponse(snapshot_path, media_type="image/jpeg")
+    raise HTTPException(status_code=404, detail="No thumbnail available")
+
+
+@app.get("/cameras/status", tags=["Analytics"])
+def get_cameras_status(db: Session = Depends(get_db)):
+    rows = db.query(models.CameraStatus).all()
+    return [
+        {
+            "cctvid": r.cctvid,
+            "cctvname": r.cctvname,
+            "status": r.status,
+            "message": r.message,
+            "detail": r.detail,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/analytics/summary", tags=["Analytics"])
+def get_analytics_summary(db: Session = Depends(get_db)):
+    """Per-camera counts and status for edge HTML dashboard."""
+    config_record = db.query(models.CctvConfig).first()
+    cameras = []
+    if config_record and config_record.config_data:
+        cameras = config_record.config_data.get("cameras", [])
+
+    status_map = {r.cctvid: r for r in db.query(models.CameraStatus).all()}
+    result = []
+    for cam in cameras:
+        cid = cam.get("id")
+        if not cid:
+            continue
+        totals = db.query(
+            func.sum(models.DataTracker.ctr_in).label("total_in"),
+            func.sum(models.DataTracker.ctr_out).label("total_out"),
+        ).filter(models.DataTracker.cctvid == cid).first()
+        st = status_map.get(cid)
+        proc = active_processors.get(cid)
+        result.append({
+            "cctvid": cid,
+            "cctvname": cam.get("name"),
+            "total_in": totals.total_in or 0 if totals else 0,
+            "total_out": totals.total_out or 0 if totals else 0,
+            "processor_active": proc is not None,
+            "status": st.status if st else "unknown",
+            "message": st.message if st else None,
+            "window_in": proc.ctr_in if proc else 0,
+            "window_out": proc.ctr_out if proc else 0,
+        })
+    return result
 
 from pydantic import BaseModel
 import requests
@@ -319,6 +502,12 @@ def _connect_dvr_legacy(req: DvrConnectRequest):
     )
 
     if response.status_code != 200:
+        upsert_camera_status(
+            "_dvr",
+            "auth_failed",
+            message="DVR authentication failed",
+            detail=f"HTTP {response.status_code}",
+        )
         return {
             "success": False,
             "detail": f"DVR authentication failed with status code {response.status_code}",
@@ -393,6 +582,12 @@ def _connect_dvr_legacy(req: DvrConnectRequest):
     hikvision_preview.dvr_credentials["password"] = req.password
     hikvision_preview.register_cameras(cameras)
 
+    try:
+        db = SessionLocal()
+        _persist_dvr_credentials(db, req.ip, req.username, req.password)
+    finally:
+        db.close()
+
     return {
         "success": True,
         "cameras": cameras,
@@ -429,6 +624,11 @@ def connect_dvr(req: DvrConnectRequest):
         if info:
             cameras = hikvision_preview.discover_cameras()
             hikvision_preview.register_cameras(cameras)
+            try:
+                db = SessionLocal()
+                _persist_dvr_credentials(db, req.ip, req.username, req.password)
+            finally:
+                db.close()
             logger.info(
                 "Discovered %s channels via pyHik for %s",
                 len(cameras),
@@ -442,11 +642,24 @@ def connect_dvr(req: DvrConnectRequest):
             }
     except Exception as e:
         logger.warning("pyHik connect failed, using legacy ISAPI: %s", e)
+        if "401" in str(e) or "403" in str(e) or "auth" in str(e).lower():
+            upsert_camera_status(
+                "_dvr",
+                "auth_failed",
+                message="DVR authentication failed",
+                detail=str(e),
+            )
 
     try:
         return _connect_dvr_legacy(req)
     except Exception as e:
         logger.error(f"Failed to auto-discover DVR channels: {e}")
+        upsert_camera_status(
+            "_dvr",
+            "error",
+            message="Failed to connect to DVR",
+            detail=str(e),
+        )
         return {
             "success": False,
             "detail": f"Failed to connect to DVR: {str(e)}",

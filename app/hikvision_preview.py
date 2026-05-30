@@ -8,14 +8,11 @@ import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
 
 import cv2
-import requests
-import urllib3
-from requests.auth import HTTPDigestAuth
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from app.hikvision_snapshot import fetch_snapshot as shared_fetch_snapshot
+from app.hikvision_snapshot import fetch_snapshot_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +87,7 @@ def validate_and_connect(ip: str, username: str, password: str) -> Optional[Dict
 
 
 def _build_rtsp_url(channel_id: str) -> str:
+    from urllib.parse import quote
 
     ip = dvr_credentials.get("ip", "")
     username = dvr_credentials.get("username", "")
@@ -184,74 +182,23 @@ def register_cameras(cameras: List[Dict[str, Any]]):
 
 
 def _fetch_snapshot_raw(channel_id: str) -> Optional[bytes]:
-
-    ip = dvr_credentials.get("ip")
-    username = dvr_credentials.get("username")
-    password = dvr_credentials.get("password")
-
-    if not ip or not username:
-        return None
-
-    url = (
-        f"http://{ip}/ISAPI/Streaming/channels/{channel_id}/picture"
-        f"?videoResolutionWidth={SNAPSHOT_WIDTH}"
-        f"&videoResolutionHeight={SNAPSHOT_HEIGHT}"
-    )
-
-    try:
-        response = requests.get(
-            url,
-            auth=HTTPDigestAuth(username, password),
-            timeout=8,
-            verify=False,
-        )
-
-        if (
-            response.status_code == 200
-            and response.content.startswith(b"\xff\xd8")
-        ):
-            return response.content
-
-        logger.warning(
-            "Raw snapshot failed for channel %s: status=%s bytes=%s",
-            channel_id,
-            response.status_code,
-            len(response.content) if response.content else 0,
-        )
-
-    except Exception as e:
-        logger.warning("Raw snapshot error for channel %s: %s", channel_id, e)
-
-    return None
+    return fetch_snapshot_bytes(channel_id, dvr_credentials)
 
 
 def _fetch_snapshot_pyhik(channel: int, stream_type: int) -> Optional[bytes]:
+    from app.hikvision_snapshot import fetch_snapshot_pyhik
 
-    if not isapi_client:
-        return None
-
-    try:
-        data = isapi_client.get_snapshot(
-            channel=channel,
-            stream_type=stream_type,
-        )
-
-        if data and data.startswith(b"\xff\xd8"):
-            return data
-
-    except Exception as e:
-        logger.warning("pyHik snapshot error channel %s: %s", channel, e)
-
-    return None
+    return fetch_snapshot_pyhik(channel, stream_type, isapi_client)
 
 
 def fetch_snapshot(channel_id: str, channel: int, stream_type: int) -> Optional[bytes]:
-
-    data = _fetch_snapshot_raw(channel_id)
-    if data:
-        return data
-
-    return _fetch_snapshot_pyhik(channel, stream_type)
+    return shared_fetch_snapshot(
+        channel_id,
+        channel,
+        stream_type,
+        dvr_credentials,
+        isapi_client,
+    )
 
 
 def _fetch_demo_frame() -> Optional[bytes]:
