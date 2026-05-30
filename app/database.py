@@ -5,7 +5,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 # Use environment variable or fallback to a default local postgres url
 SQLALCHEMY_DATABASE_URL = os.getenv(
     "DATABASE_URL", 
-    "postgresql://postgres:POSTGRES@localhost:5432/footfall_db"
+    "postgresql://postgres:postgres@localhost:5433/footfall_db"
 )
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL)

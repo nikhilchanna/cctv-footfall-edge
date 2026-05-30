@@ -17,6 +17,7 @@ import app.models as models
 import app.schemas as schemas
 import app.tasks as tasks
 from app.cv_processor import CCTVProcessor
+from app import hikvision_preview
 import logging
 
 # Set up a basic logger for error reporting
@@ -25,6 +26,56 @@ logger = logging.getLogger(__name__)
 
 # Dictionary to hold running CCTV processors
 active_processors = {}
+_suspended_for_preview: list = []
+
+
+def _suspend_processors_for_dvr_preview(db: Session):
+    """Stop RTSP processors so DVR ISAPI snapshots are not starved."""
+    global _suspended_for_preview
+
+    if _suspended_for_preview:
+        return
+
+    db_config = db.query(models.CctvConfig).first()
+    if db_config and db_config.config_data:
+        _suspended_for_preview = list(
+            db_config.config_data.get("cameras", [])
+        )
+
+    for cam_id, processor in list(active_processors.items()):
+        logger.info("Pausing CCTV processor %s for DVR line-drawing preview", cam_id)
+        processor.stop()
+        processor.join(timeout=2)
+        del active_processors[cam_id]
+
+
+def _resume_processors_after_dvr_preview():
+    """Restart RTSP processors after DVR preview ends."""
+    global _suspended_for_preview
+
+    if not _suspended_for_preview:
+        return
+
+    for cam in _suspended_for_preview:
+        cam_id = cam.get("id")
+        if cam_id in active_processors:
+            continue
+
+        logger.info("Resuming CCTV processor %s after DVR preview", cam_id)
+        processor = CCTVProcessor(
+            cctv_id=cam_id,
+            cctv_name=cam.get("name"),
+            stream_url=cam.get("rtsp_url"),
+            line_coords=cam.get(
+                "line_coords",
+                {"x1": 0, "y1": 200, "x2": 640, "y2": 200},
+            ),
+            window_size=cam.get("window_size", 10),
+        )
+        processor.start()
+        active_processors[cam_id] = processor
+
+    _suspended_for_preview = []
 
 # Initialize the database and create tables if they don't exist
 Base.metadata.create_all(bind=engine)
@@ -99,11 +150,14 @@ async def lifespan(app: FastAPI):
         processor.join(timeout=2)
     logger.info("All CCTV Processors stopped.")
 
+    hikvision_preview.stop_preview()
+    hikvision_preview.close_client()
+
 app = FastAPI(title="Footfall Counter Service", version="1.0.0", lifespan=lifespan)
 
 app.mount("/media", StaticFiles(directory="."), name="media")
 
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, Response
 import asyncio
 
 async def frame_generator(cctv_id: str):
@@ -185,6 +239,11 @@ def update_cctv_config(config: schemas.CctvConfigCreate, db: Session = Depends(g
     
     # Dynamically apply new configuration parameters to processors
     try:
+        global _suspended_for_preview
+
+        hikvision_preview.stop_preview()
+        _suspended_for_preview = []
+
         cameras = config.config_data.get("cameras", [])
         for cam in cameras:
             cam_id = cam.get("id")
@@ -243,99 +302,200 @@ class DvrConnectRequest(BaseModel):
     username: str
     password: str
 
+
+class PreviewStartRequest(BaseModel):
+    channel_id: str
+
+
+def _connect_dvr_legacy(req: DvrConnectRequest):
+    """Legacy ISAPI XML discovery fallback when pyHik is unavailable."""
+
+    logger.info(f"Authenticating with Hikvision DVR via ISAPI (legacy): {req.ip}")
+    response = requests.get(
+        f"http://{req.ip}/ISAPI/System/deviceInfo",
+        auth=HTTPDigestAuth(req.username, req.password),
+        timeout=5,
+        verify=False,
+    )
+
+    if response.status_code != 200:
+        return {
+            "success": False,
+            "detail": f"DVR authentication failed with status code {response.status_code}",
+        }
+
+    xml_response = requests.get(
+        f"http://{req.ip}/ISAPI/Streaming/channels",
+        auth=HTTPDigestAuth(req.username, req.password),
+        timeout=5,
+        verify=False,
+    )
+
+    cameras = []
+    encoded_password = quote(req.password)
+    seen_channels = set()
+
+    if xml_response.status_code == 200:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml_response.content)
+        namespace = ""
+        if "xmlns" in root.tag:
+            namespace = root.tag.split("}")[0] + "}"
+
+        for channel in root.findall(f".//{namespace}StreamingChannel"):
+            id_elem = channel.find(f"{namespace}id")
+            name_elem = channel.find(f"{namespace}channelName")
+            if id_elem is None:
+                continue
+
+            channel_id = id_elem.text
+            if not channel_id.endswith("01"):
+                continue
+
+            cam_no = int(channel_id) // 100
+            if cam_no in seen_channels:
+                continue
+            seen_channels.add(cam_no)
+
+            name = name_elem.text if name_elem is not None else f"Camera {cam_no}"
+            rtsp_url = (
+                f"rtsp://{req.username}:{encoded_password}@{req.ip}:554"
+                f"/Streaming/Channels/{channel_id}"
+            )
+
+            cameras.append({
+                "camera_name": name,
+                "camera_number": cam_no,
+                "channel_id": channel_id,
+                "channel": cam_no,
+                "stream_type": 1,
+                "rtsp": rtsp_url,
+            })
+
+    if not cameras:
+        for cam_no in range(1, 9):
+            channel_id = f"{cam_no}01"
+            rtsp_url = (
+                f"rtsp://{req.username}:{encoded_password}@{req.ip}:554"
+                f"/Streaming/Channels/{channel_id}"
+            )
+            cameras.append({
+                "camera_name": f"DVR Camera {cam_no}",
+                "camera_number": cam_no,
+                "channel_id": channel_id,
+                "channel": cam_no,
+                "stream_type": 1,
+                "rtsp": rtsp_url,
+            })
+
+    hikvision_preview.dvr_credentials["ip"] = req.ip
+    hikvision_preview.dvr_credentials["username"] = req.username
+    hikvision_preview.dvr_credentials["password"] = req.password
+    hikvision_preview.register_cameras(cameras)
+
+    return {
+        "success": True,
+        "cameras": cameras,
+        "backend": "ISAPI legacy",
+    }
+
+
 @app.post("/dvr/connect", tags=["DVR HMI"])
 def connect_dvr(req: DvrConnectRequest):
     """Validate Hikvision DVR connection via ISAPI and auto-populate available camera channels."""
     if req.ip == "demo":
         logger.info("Initializing simulated demo DVR channels...")
+        demo_cameras = [
+            {
+                "camera_name": "Demo Entrance Camera",
+                "camera_number": 1,
+                "channel_id": "demo",
+                "channel": 0,
+                "stream_type": 1,
+                "rtsp": "demo",
+            }
+        ]
+        hikvision_preview.register_cameras(demo_cameras)
         return {
             "success": True,
-            "cameras": [
-                {
-                    "camera_name": "Demo Entrance Camera",
-                    "camera_number": 1,
-                    "channel_id": "demo",
-                    "rtsp": "demo"
-                }
-            ]
+            "cameras": demo_cameras,
+            "backend": "demo",
         }
 
     try:
-        logger.info(f"Authenticating with Hikvision DVR via ISAPI: {req.ip}")
-        # Validate connection using Hikvision's ISAPI deviceInfo
-        response = requests.get(
-            f"http://{req.ip}/ISAPI/System/deviceInfo",
-            auth=HTTPDigestAuth(req.username, req.password),
-            timeout=5,
-            verify=False
+        info = hikvision_preview.validate_and_connect(
+            req.ip, req.username, req.password
         )
-        
-        if response.status_code != 200:
-            logger.warning(f"Hikvision authentication failed for {req.ip}: status {response.status_code}")
+        if info:
+            cameras = hikvision_preview.discover_cameras()
+            hikvision_preview.register_cameras(cameras)
+            logger.info(
+                "Discovered %s channels via pyHik for %s",
+                len(cameras),
+                req.ip,
+            )
             return {
-                "success": False,
-                "detail": f"DVR authentication failed with status code {response.status_code}"
+                "success": True,
+                "cameras": cameras,
+                "device": info.get("deviceName", req.ip),
+                "backend": "pyHik ISAPIClient",
             }
-            
-        # Discover dynamically from ISAPI
-        xml_response = requests.get(
-            f"http://{req.ip}/ISAPI/Streaming/channels",
-            auth=HTTPDigestAuth(req.username, req.password),
-            timeout=5,
-            verify=False
-        )
-        
-        cameras = []
-        encoded_password = quote(req.password)
-        
-        if xml_response.status_code == 200:
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(xml_response.content)
-            namespace = ""
-            if "xmlns" in root.tag:
-                namespace = root.tag.split('}')[0] + '}'
-                
-            for channel in root.findall(f".//{namespace}StreamingChannel"):
-                id_elem = channel.find(f"{namespace}id")
-                name_elem = channel.find(f"{namespace}channelName")
-                if id_elem is not None:
-                    channel_id = id_elem.text
-                    
-                    # We prefer Substreams (channel ID ending in '02' or '2') to save bandwidth
-                    # but we will return whatever Hikvision provides.
-                    name = name_elem.text if name_elem is not None else f"Camera {channel_id}"
-                    
-                    # LIVE stream path is /Streaming/Channels/, not /tracks/ (which is playback)
-                    rtsp_url = f"rtsp://{req.username}:{encoded_password}@{req.ip}:554/Streaming/Channels/{channel_id}"
-                    
-                    cameras.append({
-                        "camera_name": name,
-                        "camera_number": len(cameras) + 1,
-                        "channel_id": channel_id,
-                        "rtsp": rtsp_url
-                    })
-        
-        # Fallback if XML fails
-        if not cameras:
-            logger.warning("Dynamic XML parsing failed or empty, falling back to 16-channel generation.")
-            for cam_no in range(1, 17):
-                channel_id = f"{cam_no}02"
-                rtsp_url = f"rtsp://{req.username}:{encoded_password}@{req.ip}:554/Streaming/Channels/{channel_id}"
-                cameras.append({
-                    "camera_name": f"DVR Camera {cam_no}",
-                    "camera_number": cam_no,
-                    "channel_id": channel_id,
-                    "rtsp": rtsp_url
-                })
-            
-        logger.info(f"Successfully auto-discovered {len(cameras)} Hikvision DVR channels!")
-        return {
-            "success": True,
-            "cameras": cameras
-        }
+    except Exception as e:
+        logger.warning("pyHik connect failed, using legacy ISAPI: %s", e)
+
+    try:
+        return _connect_dvr_legacy(req)
     except Exception as e:
         logger.error(f"Failed to auto-discover DVR channels: {e}")
         return {
             "success": False,
-            "detail": f"Failed to connect to DVR: {str(e)}"
+            "detail": f"Failed to connect to DVR: {str(e)}",
         }
+
+
+@app.post("/dvr/preview/start", tags=["DVR HMI"])
+def dvr_preview_start(req: PreviewStartRequest, db: Session = Depends(get_db)):
+    """Start lightweight ISAPI snapshot polling for line-drawing (one camera)."""
+    _suspend_processors_for_dvr_preview(db)
+
+    if not hikvision_preview.start_preview(req.channel_id):
+        _resume_processors_after_dvr_preview()
+        raise HTTPException(
+            status_code=404,
+            detail=f"Could not start preview for channel {req.channel_id}",
+        )
+    return {"success": True, "channel_id": req.channel_id}
+
+
+@app.post("/dvr/preview/stop", tags=["DVR HMI"])
+def dvr_preview_stop():
+    """Stop snapshot polling and release DVR preview connection."""
+    hikvision_preview.stop_preview()
+    _resume_processors_after_dvr_preview()
+    return {"success": True}
+
+
+@app.get("/dvr/session", tags=["DVR HMI"])
+def dvr_session_status():
+    """Return whether a DVR login session is still active (credentials + discovered channels)."""
+    return hikvision_preview.get_session_status()
+
+
+@app.get("/dvr/frame/{channel_id}", tags=["DVR HMI"])
+def dvr_preview_frame(channel_id: str):
+    """Return latest cached JPEG for line-drawing UI (instant, no blocking)."""
+    if channel_id not in hikvision_preview.camera_store and channel_id != "demo":
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    hikvision_preview.ensure_preview(channel_id)
+
+    frame_data = hikvision_preview.get_cached_frame(channel_id)
+
+    if frame_data:
+        return Response(
+            frame_data,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return Response(status_code=204)
