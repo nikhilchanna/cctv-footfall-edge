@@ -13,6 +13,16 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
+
+def init_db(*, create_only: bool = False) -> None:
+    """Create tables for new installs; optionally skip versioned migrations."""
+    Base.metadata.create_all(bind=engine)
+    if not create_only:
+        from app.migrations.runner import run_migrations
+
+        run_migrations(engine)
+
+
 def get_db():
     db = SessionLocal()
     try:

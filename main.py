@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 
-from app.database import engine, Base, get_db, SessionLocal
+from app.database import engine, get_db, SessionLocal, init_db
 import app.models as models
 import app.schemas as schemas
 import app.tasks as tasks
@@ -148,8 +148,8 @@ def _resume_processors_after_dvr_preview():
 
     _suspended_for_preview = []
 
-# Initialize the database and create tables if they don't exist
-Base.metadata.create_all(bind=engine)
+# Create tables and apply pending SQL migrations on startup.
+init_db()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

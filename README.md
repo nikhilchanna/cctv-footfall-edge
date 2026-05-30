@@ -133,10 +133,10 @@ Processor status API: `GET /processor/{cctv_id}/status`
 - Peak images upload to server every 20s (`PEAK_UPLOAD_URL`, default `http://localhost:8081/api/v1/peak-images`)
 - After upload, edge keeps at most **15 successful uploads per camera** (older files removed)
 
-New DB columns/tables (`camera_status`, peak upload fields): restart edge after deploy; for existing Postgres run:
+Schema changes for existing Postgres are applied automatically on startup via versioned SQL migrations in `app/migrations/versions/` (tracked in `edge_schema_migrations`). To apply manually without starting the API:
 
-```sql
-ALTER TABLE minute_peak_snapshot ADD COLUMN IF NOT EXISTS uploaded_to_server VARCHAR DEFAULT 'Pending';
-ALTER TABLE minute_peak_snapshot ADD COLUMN IF NOT EXISTS server_path VARCHAR;
-ALTER TABLE minute_peak_snapshot ADD COLUMN IF NOT EXISTS uploaded_at TIMESTAMPTZ;
+```bash
+python migrate.py
 ```
+
+Add new migrations as `NNN_description.sql` (three-digit prefix, e.g. `002_add_foo.sql`).
