@@ -5,24 +5,49 @@ import logging
 import subprocess
 import os
 import numpy as np
+import json
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from deep_sort_realtime.deepsort_tracker import DeepSort
-from ultralytics import YOLO
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
 from app.database import SessionLocal
 from app.models import DataTracker, ProcessingCursor, MinutePeakSnapshot
+from app.peak_bucket import floor_peak_bucket, peak_bucket_folder, peak_image_filename
 from app.error_reporting import report_internal_error
 from app.camera_status import upsert_camera_status
 from app.hikvision_snapshot import ISAPISnapshotCapture
+from cv_engine.engine import CrowdCountingEngine
+from cv_engine.config import load_engine_config
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_FPS = 7
 JPEG_ENCODE_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, 70]
+DEBUG_LOG = "/Users/home/analytics_footfall/.cursor/debug-b17557.log"
+
+
+def _agent_log(hypothesis_id, location, message, data=None):
+    # region agent log
+    try:
+        with open(DEBUG_LOG, "a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "sessionId": "b17557",
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data or {},
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+    # endregion
 
 
 class FFmpegVideoCapture:
@@ -178,10 +203,6 @@ class FFmpegVideoCapture:
         return True
 
 
-def _floor_minute(dt: datetime) -> datetime:
-    return dt.replace(second=0, microsecond=0)
-
-
 class CCTVProcessor(threading.Thread):
     def __init__(
         self,
@@ -192,6 +213,7 @@ class CCTVProcessor(threading.Thread):
         stream_url: str = None,
         source_config: dict = None,
         dvr_config: dict = None,
+        cv_engine_config: dict = None,
     ):
         super().__init__()
         self.cctv_id = cctv_id
@@ -203,10 +225,9 @@ class CCTVProcessor(threading.Thread):
         self.dvr_config = dvr_config or {}
         self.running = True
 
-        self.model = YOLO("yolov8n.pt")
-        self.tracker = DeepSort(max_age=30, n_init=3, nms_max_overlap=1.0)
-
-        self.track_history = {}
+        self.engine = CrowdCountingEngine(
+            load_engine_config(cv_engine_config or {}, line_coords=line_coords)
+        )
         self.ctr_in = 0
         self.ctr_out = 0
         self.window_start_time = datetime.now(timezone.utc)
@@ -221,6 +242,7 @@ class CCTVProcessor(threading.Thread):
             "best_at": None,
         }
         self.frames_this_minute = 0
+        self._process_frame_idx = 0
         self.stream_fps = float(self.source_config.get("poll_fps", DEFAULT_POLL_FPS))
         self.stats = {
             "source_type": self.source_config.get("type", "rtsp"),
@@ -275,20 +297,6 @@ class CCTVProcessor(threading.Thread):
 
         return FFmpegVideoCapture(self.stream_url)
 
-    def is_crossing_line(self, pt1, pt2, line_pt1, line_pt2):
-        def ccw(A, B, C):
-            return (C[1] - A[1]) * (B[0] - A[0]) > (B[1] - A[1]) * (C[0] - A[0])
-
-        A, B = line_pt1, line_pt2
-        C, D = pt1, pt2
-
-        intersect = ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
-        if intersect:
-            if pt1[1] < pt2[1]:
-                return 1
-            return -1
-        return 0
-
     def save_window_data(self, end_time, current_in, current_out):
         db: Session = SessionLocal()
         try:
@@ -337,7 +345,7 @@ class CCTVProcessor(threading.Thread):
     def _update_processing_cursor(self, current_time: datetime):
         db: Session = SessionLocal()
         try:
-            minute_bucket = _floor_minute(current_time)
+            minute_bucket = floor_peak_bucket(current_time)
             cursor = (
                 db.query(ProcessingCursor)
                 .filter(ProcessingCursor.cctvid == self.cctv_id)
@@ -360,9 +368,11 @@ class CCTVProcessor(threading.Thread):
             db.close()
 
     def _save_minute_peak(self, minute_bucket: datetime, people_count: int, jpeg_bytes: bytes):
+        minute_bucket = floor_peak_bucket(minute_bucket)
         os.makedirs("snapshots/peaks", exist_ok=True)
-        stamp = minute_bucket.strftime("%Y%m%d%H%M")
-        image_path = os.path.join("snapshots", "peaks", f"{self.cctv_id}_{stamp}.jpg")
+        image_path = os.path.join(
+            "snapshots", "peaks", peak_image_filename(self.cctv_id, minute_bucket)
+        )
 
         with open(image_path, "wb") as handle:
             handle.write(jpeg_bytes)
@@ -401,7 +411,7 @@ class CCTVProcessor(threading.Thread):
                 )
             db.commit()
             logger.info(
-                f"[{self.cctv_id}] Saved minute peak bucket={minute_bucket} people={people_count}"
+                f"[{self.cctv_id}] Saved peak bucket={minute_bucket} people={people_count}"
             )
         except IntegrityError:
             db.rollback()
@@ -411,8 +421,53 @@ class CCTVProcessor(threading.Thread):
         finally:
             db.close()
 
+    def _annotate_frame(self, frame, result, l_pt1, l_pt2, zone_colors):
+        for track in result.active_tracks:
+            x1, y1, x2, y2 = track.bbox
+            color = (0, 255, 0) if not track.counted else (0, 165, 255)
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+            cv2.putText(
+                frame,
+                f"ID: {track.track_id}",
+                (int(x1), int(y1) - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+            )
+
+        overlay = self.engine.get_zone_overlay()
+        for zone_name, color in zone_colors.items():
+            pts = overlay.get(zone_name)
+            if pts:
+                arr = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(frame, [arr], True, color, 2)
+
+        head_line = overlay.get("head_line")
+        if head_line and len(head_line) >= 2:
+            cv2.line(
+                frame,
+                (int(head_line[0][0]), int(head_line[0][1])),
+                (int(head_line[1][0]), int(head_line[1][1])),
+                (0, 165, 255),
+                3,
+            )
+
+        cv2.line(frame, l_pt1, l_pt2, (255, 0, 0), 2)
+        path = self.engine.active_footfall_path
+        cv2.putText(
+            frame,
+            f"IN: {self.ctr_in} | OUT: {self.ctr_out} | PEAK: {self.stats['current_peak_people']} | "
+            f"{result.density_level} | {path}",
+            (20, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.85,
+            (0, 0, 255),
+            2,
+        )
+
     def _handle_minute_rollover(self, current_time: datetime, people_count: int, frame):
-        minute_bucket = _floor_minute(current_time)
+        minute_bucket = floor_peak_bucket(current_time)
         state = self.minute_state
 
         if state["bucket"] is None:
@@ -492,6 +547,7 @@ class CCTVProcessor(threading.Thread):
         finally:
             db.close()
 
+        eng_status = self.engine.get_status_fields()
         with self.lock:
             return {
                 "cctv_id": self.cctv_id,
@@ -504,6 +560,12 @@ class CCTVProcessor(threading.Thread):
                 "window_in": self.ctr_in,
                 "window_out": self.ctr_out,
                 "stream_fps": self.stream_fps,
+                "density_level": eng_status.get("density_level", "LOW"),
+                "footfall_mode": eng_status.get("footfall_mode", "hybrid"),
+                "camera_role": eng_status.get("camera_role", "footfall"),
+                "count_direction": eng_status.get("count_direction", "both"),
+                "active_footfall_path": eng_status.get("active_footfall_path", "body_zones"),
+                "processing_state": "running",
                 "cursor": cursor_data,
                 "last_saved_peak": peak_data,
             }
@@ -563,6 +625,11 @@ class CCTVProcessor(threading.Thread):
 
         l_pt1 = (self.line_coords.get("x1", 0), self.line_coords.get("y1", 200))
         l_pt2 = (self.line_coords.get("x2", 640), self.line_coords.get("y2", 200))
+        zone_colors = {
+            "entry": (0, 255, 0),
+            "buffer": (0, 255, 255),
+            "exit": (0, 0, 255),
+        }
 
         while self.running:
             ret, frame = cap.read()
@@ -614,76 +681,61 @@ class CCTVProcessor(threading.Thread):
                     args=(current_time, in_count, out_count),
                 ).start()
 
-            results = self.model(frame, classes=[0], verbose=False)
+            try:
+                result = self.engine.process(frame)
+            except Exception as exc:
+                logger.exception("[%s] Frame processing failed: %s", self.cctv_id, exc)
+                self._report_status("error", "Frame processing failed", detail=str(exc)[:200])
+                time.sleep(0.5)
+                continue
 
-            bbs = []
-            for r in results:
-                boxes = r.boxes
-                for box in boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    conf = box.conf[0].item()
-                    bbs.append(([x1, y1, x2 - x1, y2 - y1], conf, "person"))
+            self._process_frame_idx += 1
+            if self._process_frame_idx % 30 == 0:
+                # region agent log
+                h, w = frame.shape[:2]
+                _agent_log(
+                    "C",
+                    "cv_processor.py:run",
+                    "live frame",
+                    {
+                        "cctv_id": self.cctv_id,
+                        "frame_idx": self._process_frame_idx,
+                        "shape": [w, h],
+                        "frame_mean": round(float(frame.mean()), 2),
+                        "failures": self.stats.get("consecutive_failures", 0),
+                        "source": self._resolve_source_type(),
+                    },
+                )
+                _agent_log(
+                    "A",
+                    "cv_processor.py:run",
+                    "live detection",
+                    {
+                        "cctv_id": self.cctv_id,
+                        "tracks": len(result.active_tracks),
+                        "current_count": result.current_count,
+                        "in_window": self.ctr_in,
+                        "out_window": self.ctr_out,
+                        "density": result.density_level,
+                        "path": self.engine.active_footfall_path,
+                    },
+                )
+                # endregion
 
-            people_count = len(bbs)
+            self.ctr_in += result.in_count_delta
+            self.ctr_out += result.out_count_delta
+            people_count = result.current_count
+
+            self._annotate_frame(
+                frame,
+                result,
+                l_pt1,
+                l_pt2,
+                zone_colors,
+            )
+            # Peak JPEGs must include boxes/zones, not raw camera frame
             self._handle_minute_rollover(current_time, people_count, frame)
             self._update_processing_cursor(current_time)
-
-            tracks = self.tracker.update_tracks(bbs, frame=frame)
-
-            for track in tracks:
-                if not track.is_confirmed():
-                    continue
-
-                track_id = track.track_id
-                ltrb = track.to_ltrb()
-
-                center_x = int((ltrb[0] + ltrb[2]) / 2)
-                center_y = int((ltrb[1] + ltrb[3]) / 2)
-                current_pt = (center_x, center_y)
-
-                cv2.rectangle(
-                    frame,
-                    (int(ltrb[0]), int(ltrb[1])),
-                    (int(ltrb[2]), int(ltrb[3])),
-                    (0, 255, 0),
-                    2,
-                )
-                cv2.putText(
-                    frame,
-                    f"ID: {track_id}",
-                    (int(ltrb[0]), int(ltrb[1]) - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 0),
-                    2,
-                )
-
-                if track_id in self.track_history:
-                    prev_pt = self.track_history[track_id]
-                    direction = self.is_crossing_line(prev_pt, current_pt, l_pt1, l_pt2)
-                    if direction == 1:
-                        self.ctr_in += 1
-                        logger.info(f"[{self.cctv_id}] Person crossed IN")
-                        del self.track_history[track_id]
-                        continue
-                    if direction == -1:
-                        self.ctr_out += 1
-                        logger.info(f"[{self.cctv_id}] Person crossed OUT")
-                        del self.track_history[track_id]
-                        continue
-
-                self.track_history[track_id] = current_pt
-
-            cv2.line(frame, l_pt1, l_pt2, (255, 0, 0), 3)
-            cv2.putText(
-                frame,
-                f"IN: {self.ctr_in} | OUT: {self.ctr_out} | PEAK: {self.stats['current_peak_people']}",
-                (20, 50),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (0, 0, 255),
-                3,
-            )
 
             ret_enc, jpeg_bytes = cv2.imencode(".jpg", frame, JPEG_ENCODE_PARAMS)
             if ret_enc:
@@ -693,5 +745,14 @@ class CCTVProcessor(threading.Thread):
         cap.release()
         logger.info(f"Stopped CCTV Processor for {self.cctv_id}")
 
+    def _flush_current_peak_bucket(self):
+        """Save open bucket on stop so peak is not lost."""
+        state = self.minute_state
+        if state.get("bucket") is not None and state.get("best_jpeg") is not None:
+            self._save_minute_peak(
+                state["bucket"], state["peak_count"], state["best_jpeg"]
+            )
+
     def stop(self):
+        self._flush_current_peak_bucket()
         self.running = False

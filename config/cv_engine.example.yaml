@@ -1,0 +1,56 @@
+# cv_engine example — runtime uses JSON inside POST /config cameras[].cv_engine
+
+detector:
+  person:
+    model_path: models/yolov8n.pt
+    detector_type: person_coco
+    class_ids: [0]
+    conf_threshold: 0.35
+    iou_threshold: 0.45
+  head:
+    model_path: models/scut_head_yolov8n.pt
+    detector_type: head_scut
+    class_ids: [0]
+    enabled: true
+    conf_threshold: 0.30
+    iou_threshold: 0.45
+
+tracker:
+  type: bytetrack
+  track_thresh: 0.5
+  track_buffer: 30
+
+density:
+  low_threshold: 0.002
+  high_threshold: 0.008
+
+zones:
+  auto_generate: true
+  entry_offset_pixels: 80
+  buffer_width_pixels: 80
+  exit_offset_pixels: 80
+  entry_side: above
+
+occlusion:
+  max_lost_frames: 15
+  reattach_threshold_px: 80
+
+confidence:
+  det_weight: 0.4
+  track_weight: 0.35
+  density_weight: 0.25
+
+footfall:
+  mode: hybrid
+  count_direction: both
+  camera_role: footfall
+  head_line:
+    dedup_ms: 400
+    grid_cells: 8
+    match_distance_px: 60
+  hybrid:
+    use_head_when: high
+
+inference:
+  device: cuda:0
+  max_concurrent: 2

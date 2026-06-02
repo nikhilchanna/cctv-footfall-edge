@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Edge Video Test — Zone Transition</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #0f1117;
+      color: #e8eaed;
+      max-width: 1320px;
+    }
+    h1 { margin: 0 0 8px; font-size: 1.4rem; }
+    .sub { color: #9aa0a6; margin-bottom: 16px; font-size: 0.9rem; }
+    .panel {
+      background: #1a1d27;
+      border: 1px solid #2d3140;
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    label { display: block; font-size: 0.85rem; margin-bottom: 6px; color: #bdc1c6; }
+    input[type=text], input[type=number], select {
+      width: 100%;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid #3c4043;
+      background: #0f1117;
+      color: #fff;
+      font-size: 0.95rem;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; align-items: center; }
+    button {
+      padding: 10px 18px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .primary { background: #34a853; color: #fff; }
+    .secondary { background: #5f6368; color: #fff; }
+    .danger { background: #ea4335; color: #fff; }
+    .step { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: #8ab4f8; margin-bottom: 8px; }
+    .draw-wrap {
+      position: relative;
+      width: 100%;
+      max-width: 1280px;
+      background: #000;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    #drawCanvas {
+      display: block;
+      width: 100%;
+      height: auto;
+      cursor: crosshair;
+      touch-action: none;
+    }
+    .feed {
+      width: 100%;
+      max-width: 1280px;
+      aspect-ratio: 16/9;
+      background: #000;
+      border-radius: 10px;
+      object-fit: contain;
+    }
+    .stats-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .stat-box {
+      background: #0f1117;
+      border: 1px solid #2d3140;
+      border-radius: 10px;
+      padding: 14px;
+      text-align: center;
+    }
+    .stat-box .label { font-size: 0.75rem; color: #9aa0a6; margin-bottom: 4px; }
+    .stat-box .value { font-size: 1.8rem; font-weight: 700; line-height: 1.1; }
+    .stat-box.in .value { color: #34a853; }
+    .stat-box.out .value { color: #ea4335; }
+    .stat-box.people .value { color: #8ab4f8; }
+    pre {
+      background: #0f1117;
+      border: 1px solid #2d3140;
+      border-radius: 8px;
+      padding: 12px;
+      overflow: auto;
+      font-size: 0.78rem;
+      max-height: 240px;
+    }
+    .hidden { display: none !important; }
+    .warn { color: #fbbc04; }
+    .ok { color: #34a853; }
+    .bad { color: #ea4335; }
+    .pill {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(138, 180, 248, 0.15);
+      color: #8ab4f8;
+      font-size: 0.8rem;
+    }
+    .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 0.8rem; margin: 8px 0; }
+    .legend span { display: flex; align-items: center; gap: 6px; }
+    .swatch { width: 14px; height: 14px; border-radius: 3px; }
+    .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Edge video test</h1>
+  <p class="sub">Head detect → ByteTrack → <strong>observation → count</strong> zone transition. Line must be <strong>perpendicular to crowd flow</strong>.</p>
+
+  <div class="panel" style="border-color:#fbbc04">
+    <strong style="color:#fbbc04">Cross-angle camera?</strong>
+    <p class="sub" style="margin:8px 0 0">
+      If people move <strong>left → right</strong> (or right → left), draw a <strong>vertical</strong> counting line — not horizontal.
+      Set far side to <strong>Left of line</strong> when crowd enters from the left.
+      Horizontal lines only work when crowd walks toward/away from camera (up/down in frame).
+    </p>
+  </div>
+
+  <div class="panel" id="panelPath">
+    <div class="step">Step 1 — Video &amp; camera role</div>
+    <label for="videoPath">Absolute path to MP4 on edge machine</label>
+    <input id="videoPath" type="text" value="/Users/home/Downloads/people/people_counting.mp4" placeholder="/Users/you/videos/crowd.mp4" />
+    <div class="grid2">
+      <label>Camera role
+        <select id="cameraRole">
+          <option value="IN" selected>IN (counts toward IN)</option>
+          <option value="OUT">OUT (counts toward OUT)</option>
+          <option value="occupancy_only">Occupancy only</option>
+        </select>
+      </label>
+      <label>Count direction filter
+        <select id="countDirection">
+          <option value="both">Both (default)</option>
+          <option value="in_only">IN only</option>
+          <option value="out_only">OUT only</option>
+        </select>
+      </label>
+      <label>Far side (observation)
+        <select id="entrySide">
+          <option value="above">Above line ↓ (horizontal — crowd walks down)</option>
+          <option value="below">Below line ↑ (horizontal — crowd walks up)</option>
+        </select>
+      </label>
+      <label>Head conf (dense crowd)
+        <input id="headConf" type="number" value="0.22" min="0.1" max="0.9" step="0.01" />
+      </label>
+      <label>Observation depth (px)
+        <input id="obsOffset" type="number" value="150" min="20" max="500" />
+      </label>
+      <label>Count strip width (px)
+        <input id="countWidth" type="number" value="80" min="20" max="300" />
+      </label>
+      <label>Ignore depth (px)
+        <input id="ignoreOffset" type="number" value="100" min="20" max="500" />
+      </label>
+    </div>
+    <div class="row">
+      <button class="primary" id="btnLoad">Load first frame</button>
+    </div>
+    <p id="msgPath" class="sub" style="margin-top:10px;margin-bottom:0"></p>
+  </div>
+
+  <div class="panel hidden" id="panelDraw">
+    <div class="step">Step 2 — Draw counting line &amp; inspect zones</div>
+    <p class="sub" style="margin-top:0">Drag the red counting line. Zones generate perpendicular to it. Count = head crosses <strong>observation → count</strong> along flow direction.</p>
+    <div class="row" style="margin-bottom:8px">
+      <button type="button" class="secondary" id="presetLr">Preset: crowd L→R (vertical line)</button>
+      <button type="button" class="secondary" id="presetDown">Preset: toward camera (horizontal)</button>
+    </div>
+    <div class="legend">
+      <span><i class="swatch" style="background:#34a853"></i> Observation (far)</span>
+      <span><i class="swatch" style="background:#ff0"></i> Count strip</span>
+      <span><i class="swatch" style="background:#4285f4"></i> Ignore (near camera)</span>
+      <span><i class="swatch" style="background:#ff0000"></i> Counting line</span>
+    </div>
+    <div class="draw-wrap">
+      <canvas id="drawCanvas"></canvas>
+    </div>
+    <div class="row">
+      <span id="drawInfo" class="pill">Draw counting line</span>
+      <button class="secondary" id="btnResetLine">Reset line</button>
+      <button class="secondary" id="btnRefreshZones">Refresh zones</button>
+      <button class="primary" id="btnStart" disabled>Start analytics</button>
+    </div>
+    <p id="lineLabel" class="sub" style="margin:10px 0 0"></p>
+  </div>
+
+  <div class="panel hidden" id="panelRun">
+    <div class="step">Step 3 — Live analytics</div>
+    <div class="stats-row">
+      <div class="stat-box in">
+        <div class="label">IN</div>
+        <div class="value" id="statIn">0</div>
+      </div>
+      <div class="stat-box out">
+        <div class="label">OUT</div>
+        <div class="value" id="statOut">0</div>
+      </div>
+      <div class="stat-box people">
+        <div class="label">Active tracks</div>
+        <div class="value" id="statPeople">0</div>
+      </div>
+      <div class="stat-box">
+        <div class="label">Head dets</div>
+        <div class="value" id="statHeads" style="font-size:1.2rem">0</div>
+      </div>
+      <div class="stat-box">
+        <div class="label">Pipeline</div>
+        <div class="value" id="statMeta" style="font-size:0.85rem">zone</div>
+      </div>
+    </div>
+    <img id="feed" class="feed" alt="Annotated stream" />
+    <div class="row" style="margin-top:12px">
+      <button class="danger" id="btnStop">Stop</button>
+      <button class="secondary" id="btnRedraw">Redraw line</button>
+    </div>
+  </div>
+
+  <div class="panel hidden" id="panelDiag">
+    <h3 style="margin-top:0">Diagnostics</h3>
+    <div id="hint" class="sub"></div>
+    <pre id="stats">Waiting…</pre>
+  </div>
+
+  <script>
+    const base = window.location.origin;
+    const drawCanvas = document.getElementById('drawCanvas');
+    const ctx = drawCanvas.getContext('2d');
+    const feed = document.getElementById('feed');
+
+    let frameW = 0;
+    let frameH = 0;
+    let videoPath = '';
+    let bgImage = null;
+    let lineCoords = null;
+    let zoneOverlay = null;
+    let dragState = null;
+    let pollTimer = null;
+    const LINE_MIN = 10;
+    const ENDPOINT_HIT = 14;
+
+    function defaultLine(w, h) {
+      const x = Math.round(w * 0.42);
+      return { x1: x, y1: 0, x2: x, y2: h };
+    }
+
+    function defaultLineHorizontal(w, h) {
+      const y = Math.round(h * 0.45);
+      return { x1: Math.round(w * 0.05), y1: y, x2: Math.round(w * 0.95), y2: y };
+    }
+
+    function setEntrySideOptions(mode) {
+      const sel = document.getElementById('entrySide');
+      if (mode === 'vertical') {
+        sel.innerHTML = `
+          <option value="below">Left of line → (L→R flow)</option>
+          <option value="above">Right of line ← (R→L flow)</option>`;
+        sel.value = 'below';
+      } else {
+        sel.innerHTML = `
+          <option value="above">Above line ↓ (crowd walks down)</option>
+          <option value="below">Below line ↑ (crowd walks up)</option>`;
+        sel.value = 'above';
+      }
+    }
+
+    function applyPresetLr() {
+      if (!frameW) return;
+      lineCoords = defaultLine(frameW, frameH);
+      setEntrySideOptions('vertical');
+      refreshZonesAndRedraw();
+    }
+
+    function applyPresetDown() {
+      if (!frameW) return;
+      lineCoords = defaultLineHorizontal(frameW, frameH);
+      setEntrySideOptions('horizontal');
+      refreshZonesAndRedraw();
+    }
+
+    function lineLength(lc) {
+      if (!lc) return 0;
+      return Math.hypot(lc.x2 - lc.x1, lc.y2 - lc.y1);
+    }
+
+    function zoneParams() {
+      return {
+        line_coords: lineCoords,
+        width: frameW,
+        height: frameH,
+        observation_offset_pixels: parseInt(document.getElementById('obsOffset').value, 10) || 150,
+        count_zone_width_pixels: parseInt(document.getElementById('countWidth').value, 10) || 100,
+        ignore_offset_pixels: parseInt(document.getElementById('ignoreOffset').value, 10) || 100,
+        entry_side: document.getElementById('entrySide').value,
+      };
+    }
+
+    async function fetchZones() {
+      if (!lineCoords || lineLength(lineCoords) < LINE_MIN) {
+        zoneOverlay = null;
+        return;
+      }
+      const res = await fetch(`${base}/test/video/zones`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(zoneParams()),
+      });
+      if (!res.ok) {
+        zoneOverlay = null;
+        return;
+      }
+      zoneOverlay = await res.json();
+    }
+
+    function drawPoly(pts, stroke, fill) {
+      if (!pts || pts.length < 3) return;
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+      ctx.closePath();
+      if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    function drawLine(lc) {
+      if (!lc) return;
+      ctx.beginPath();
+      ctx.moveTo(lc.x1, lc.y1);
+      ctx.lineTo(lc.x2, lc.y2);
+      ctx.strokeStyle = '#ff0000';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      [{ x: lc.x1, y: lc.y1 }, { x: lc.x2, y: lc.y2 }].forEach((p) => {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 8, 0, Math.PI * 2);
+        ctx.fillStyle = '#8ab4f8';
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      });
+    }
+
+    function redrawCanvas() {
+      if (!bgImage) return;
+      ctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+      ctx.drawImage(bgImage, 0, 0, frameW, frameH);
+      if (zoneOverlay) {
+        drawPoly(zoneOverlay.observation || zoneOverlay.entry, '#34a853', 'rgba(52,168,83,0.2)');
+        drawPoly(zoneOverlay.count || zoneOverlay.buffer, '#ffff00', 'rgba(255,255,0,0.15)');
+        drawPoly(zoneOverlay.ignore || zoneOverlay.exit, '#4285f4', 'rgba(66,133,244,0.2)');
+      }
+      drawLine(lineCoords);
+      updateLineLabel();
+    }
+
+    function updateLineLabel() {
+      const el = document.getElementById('lineLabel');
+      if (!lineCoords || lineLength(lineCoords) < LINE_MIN) {
+        el.textContent = 'Drag the blue endpoints to place the counting line.';
+        return;
+      }
+      el.textContent =
+        `Line (${lineCoords.x1},${lineCoords.y1}) → (${lineCoords.x2},${lineCoords.y2}) · ` +
+        'Count = observation → count zone · Stopping in a zone does not count.';
+    }
+
+    function updateDrawUi() {
+      const ok = lineCoords && lineLength(lineCoords) >= LINE_MIN && zoneOverlay;
+      document.getElementById('btnStart').disabled = !ok;
+      document.getElementById('drawInfo').textContent = ok
+        ? 'Line + zones ready'
+        : 'Draw counting line (min length 10px)';
+    }
+
+    function canvasCoords(e) {
+      const rect = drawCanvas.getBoundingClientRect();
+      const scaleX = drawCanvas.width / rect.width;
+      const scaleY = drawCanvas.height / rect.height;
+      return {
+        x: Math.round((e.clientX - rect.left) * scaleX),
+        y: Math.round((e.clientY - rect.top) * scaleY),
+      };
+    }
+
+    function hitEndpoint(x, y) {
+      if (!lineCoords) return null;
+      if (Math.hypot(lineCoords.x1 - x, lineCoords.y1 - y) <= ENDPOINT_HIT) return 'p1';
+      if (Math.hypot(lineCoords.x2 - x, lineCoords.y2 - y) <= ENDPOINT_HIT) return 'p2';
+      return null;
+    }
+
+    function suggestDirectionFromRole() {
+      const role = document.getElementById('cameraRole').value;
+      const dir = document.getElementById('countDirection');
+      if (role === 'IN') dir.value = 'in_only';
+      else if (role === 'OUT') dir.value = 'out_only';
+      else if (role === 'occupancy_only') dir.value = 'both';
+    }
+
+    document.getElementById('cameraRole').addEventListener('change', suggestDirectionFromRole);
+
+    async function refreshZonesAndRedraw() {
+      await fetchZones();
+      redrawCanvas();
+      updateDrawUi();
+    }
+
+    function diagnose(s) {
+      if (s.error) return `<span class="bad">Error: ${s.error}</span>`;
+      const lines = [
+        `<span class="ok">${s.active_footfall_path || 'zone_transition'} · ${s.camera_role || '?'}</span>`,
+      ];
+      if (s.camera_role === 'occupancy_only') {
+        lines.push('<span class="ok">Occupancy only — no IN/OUT counts</span>');
+      }
+      if ((s.head_detections || 0) === 0) {
+        lines.push('<span class="bad">No head detections — check models/scut_head_yolov8n.pt</span>');
+      } else if ((s.window_in || 0) + (s.window_out || 0) > 0) {
+        lines.push('<span class="ok">Zone transition counts firing</span>');
+      } else if ((s.track_count || 0) > 0) {
+        lines.push('<span class="warn">Tracks active — need observation → count movement</span>');
+      }
+      return lines.join('<br>');
+    }
+
+    async function pollStatus() {
+      try {
+        const res = await fetch(`${base}/test/video/status`);
+        const s = await res.json();
+        document.getElementById('statIn').textContent = s.window_in ?? 0;
+        document.getElementById('statOut').textContent = s.window_out ?? 0;
+        document.getElementById('statPeople').textContent = s.track_count ?? s.current_count ?? 0;
+        document.getElementById('statHeads').textContent = s.head_detections ?? 0;
+        document.getElementById('statMeta').textContent =
+          `${s.active_footfall_path || 'zone'} · ${s.camera_role || '?'}`;
+        document.getElementById('stats').textContent = JSON.stringify(s, null, 2);
+        document.getElementById('hint').innerHTML = diagnose(s);
+      } catch (e) {
+        document.getElementById('stats').textContent = String(e);
+      }
+    }
+
+    function showDrawStep() {
+      document.getElementById('panelDraw').classList.remove('hidden');
+      document.getElementById('panelRun').classList.add('hidden');
+      document.getElementById('panelDiag').classList.add('hidden');
+      feed.removeAttribute('src');
+      if (pollTimer) clearInterval(pollTimer);
+    }
+
+    function showRunStep() {
+      document.getElementById('panelDraw').classList.add('hidden');
+      document.getElementById('panelRun').classList.remove('hidden');
+      document.getElementById('panelDiag').classList.remove('hidden');
+    }
+
+    drawCanvas.addEventListener('mousedown', (e) => {
+      const c = canvasCoords(e);
+      const hit = hitEndpoint(c.x, c.y);
+      if (hit) {
+        dragState = { kind: hit };
+        return;
+      }
+      if (!lineCoords) lineCoords = defaultLine(frameW, frameH);
+      dragState = { kind: 'new', x: c.x, y: c.y };
+      lineCoords = { x1: c.x, y1: c.y, x2: c.x, y2: c.y };
+    });
+
+    drawCanvas.addEventListener('mousemove', async (e) => {
+      if (!dragState) return;
+      const c = canvasCoords(e);
+      if (dragState.kind === 'p1') {
+        lineCoords.x1 = c.x;
+        lineCoords.y1 = c.y;
+      } else if (dragState.kind === 'p2') {
+        lineCoords.x2 = c.x;
+        lineCoords.y2 = c.y;
+      } else if (dragState.kind === 'new') {
+        lineCoords.x2 = c.x;
+        lineCoords.y2 = c.y;
+      }
+      redrawCanvas();
+    });
+
+    async function onDrawEnd() {
+      if (!dragState) return;
+      dragState = null;
+      await refreshZonesAndRedraw();
+    }
+
+    drawCanvas.addEventListener('mouseup', onDrawEnd);
+    drawCanvas.addEventListener('mouseleave', onDrawEnd);
+
+    ['obsOffset', 'countWidth', 'ignoreOffset', 'entrySide'].forEach((id) => {
+      document.getElementById(id).addEventListener('change', refreshZonesAndRedraw);
+    });
+
+    document.getElementById('btnLoad').onclick = async () => {
+      videoPath = document.getElementById('videoPath').value.trim();
+      const msg = document.getElementById('msgPath');
+      if (!videoPath) {
+        msg.textContent = 'Enter an absolute MP4 path.';
+        return;
+      }
+      msg.textContent = 'Loading first frame…';
+      await fetch(`${base}/test/video/stop`, { method: 'POST' }).catch(() => {});
+
+      const res = await fetch(`${base}/test/video/preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ video_path: videoPath }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        msg.textContent = data.detail || 'Load failed';
+        return;
+      }
+
+      frameW = data.width;
+      frameH = data.height;
+      lineCoords = defaultLine(frameW, frameH);
+      zoneOverlay = null;
+      suggestDirectionFromRole();
+      bgImage = new Image();
+      bgImage.onload = async () => {
+        drawCanvas.width = frameW;
+        drawCanvas.height = frameH;
+        setEntrySideOptions('vertical');
+        lineCoords = defaultLine(frameW, frameH);
+        await refreshZonesAndRedraw();
+        showDrawStep();
+        msg.textContent = `Loaded ${frameW}×${frameH}. Use L→R preset if crowd moves sideways.`;
+      };
+      bgImage.src = `data:image/jpeg;base64,${data.image_base64}`;
+    };
+
+    document.getElementById('btnResetLine').onclick = async () => {
+      lineCoords = defaultLine(frameW, frameH);
+      setEntrySideOptions('vertical');
+      await refreshZonesAndRedraw();
+    };
+
+    document.getElementById('presetLr').onclick = applyPresetLr;
+    document.getElementById('presetDown').onclick = applyPresetDown;
+
+    document.getElementById('btnRefreshZones').onclick = refreshZonesAndRedraw;
+
+    document.getElementById('btnStart').onclick = async () => {
+      if (lineLength(lineCoords) < LINE_MIN) {
+        alert('Counting line too short.');
+        return;
+      }
+      const zp = zoneParams();
+      const res = await fetch(`${base}/test/video/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          video_path: videoPath,
+          line_coords: lineCoords,
+          camera_role: document.getElementById('cameraRole').value,
+          count_direction: document.getElementById('countDirection').value,
+          entry_side: zp.entry_side,
+          observation_offset_pixels: zp.observation_offset_pixels,
+          count_zone_width_pixels: zp.count_zone_width_pixels,
+          ignore_offset_pixels: zp.ignore_offset_pixels,
+          head_conf_threshold: parseFloat(document.getElementById('headConf').value) || 0.22,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.detail || 'Start failed');
+        return;
+      }
+      showRunStep();
+      feed.src = `${base}/test/video/stream?t=${Date.now()}`;
+      document.getElementById('statIn').textContent = '0';
+      document.getElementById('statOut').textContent = '0';
+      if (data.live_processors_paused) {
+        document.getElementById('msgPath').textContent =
+          `Running test (live cameras paused: ${data.live_processors_paused}).`;
+      }
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(pollStatus, 800);
+      pollStatus();
+    };
+
+    document.getElementById('btnStop').onclick = async () => {
+      await fetch(`${base}/test/video/stop`, { method: 'POST' });
+      showDrawStep();
+      document.getElementById('msgPath').textContent = 'Stopped. Adjust line or start again.';
+    };
+
+    document.getElementById('btnRedraw').onclick = async () => {
+      await fetch(`${base}/test/video/stop`, { method: 'POST' });
+      showDrawStep();
+      await refreshZonesAndRedraw();
+    };
+  </script>
+</body>
+</html>

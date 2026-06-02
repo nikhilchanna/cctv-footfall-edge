@@ -68,6 +68,8 @@ class MinutePeakSnapshot(Base):
     uploaded_to_server = Column(String, default="Pending")  # Pending, Successful, Failed
     server_path = Column(String, nullable=True)
     uploaded_at = Column(DateTime(timezone=True), nullable=True)
+    upload_retry_ctr = Column(Integer, default=0)
+    last_upload_attempt = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 

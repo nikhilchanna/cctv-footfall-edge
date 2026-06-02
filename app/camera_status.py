@@ -33,6 +33,8 @@ def upsert_camera_status(
             row.message = message
         if detail is not None:
             row.detail = detail
+        elif status in ("connected", "configured"):
+            row.detail = None
         row.updated_at = datetime.now(timezone.utc)
         db.commit()
     except Exception:

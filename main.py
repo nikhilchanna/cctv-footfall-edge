@@ -1,10 +1,15 @@
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import List
+from typing import List, Optional
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,19 +23,40 @@ import app.schemas as schemas
 import app.tasks as tasks
 from app.cv_processor import CCTVProcessor
 from app import hikvision_preview
-from app.hikvision_snapshot import substream_channel_id
+from app.hikvision_snapshot import fetch_snapshot_bytes, substream_channel_id
 from app import hikvision_playback
 from app.camera_status import sync_configured_cameras, upsert_camera_status
+from app.camera_data import clear_camera_data, reset_live_processor_counters
 from app.peak_upload import peak_upload_job
+from app.video_test_runner import VideoTestSession, grab_first_frame
 import logging
+import time
 
 # Set up a basic logger for error reporting
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+import torch
+
+_cv_device = os.getenv("CV_ENGINE_DEVICE", "cuda:0")
+if torch.cuda.is_available():
+    logger.info("CUDA enabled: %s (%s)", _cv_device, torch.cuda.get_device_name(0))
+else:
+    logger.warning(
+        "CUDA requested (%s) but no GPU driver — using cpu. Run scripts/install-nvidia-driver.sh then reboot.",
+        _cv_device,
+    )
+
+# Stagger ISAPI restarts so DVR is not hit by all cameras at once
+PROCESSOR_RESTART_STAGGER_SEC = 0.25
+
 # Dictionary to hold running CCTV processors
 active_processors = {}
 _suspended_for_preview: list = []
+# User halted cameras — watchdog and config reload must not restart these
+_halted_processors: dict[str, str] = {}  # cam_id -> "paused" | "stopped"
+_video_test_session: VideoTestSession | None = None
+_processors_before_video_test: list[dict] = []
 
 
 def _get_config_record(db: Session):
@@ -94,9 +120,157 @@ def _start_processor(cam: dict, dvr_config: dict) -> CCTVProcessor:
         stream_url=cam.get("rtsp_url") or cam.get("rtsp") or "demo",
         source_config=source_config,
         dvr_config=dvr_config,
+        cv_engine_config=cam.get("cv_engine"),
     )
     processor.start()
     return processor
+
+
+def _suspend_processors_for_video_test(db: Session) -> int:
+    """Stop live processors so YOLO is not called from two threads (Mac segfault)."""
+    global _processors_before_video_test
+    record = _get_config_record(db)
+    _processors_before_video_test = []
+    if record and record.config_data:
+        for cam in record.config_data.get("cameras", []):
+            cam_id = cam.get("id")
+            if cam_id and cam_id in active_processors:
+                _processors_before_video_test.append(cam)
+    stopped = 0
+    for cam_id in list(active_processors.keys()):
+        logger.info("Pausing CCTV processor %s for video test", cam_id)
+        _stop_processor(cam_id)
+        stopped += 1
+    return stopped
+
+
+def _resume_processors_after_video_test() -> int:
+    global _processors_before_video_test
+    if not _processors_before_video_test:
+        return 0
+    db = SessionLocal()
+    resumed = 0
+    try:
+        dvr_config = _get_dvr_config(db)
+        for cam in _processors_before_video_test:
+            cam_id = cam.get("id")
+            if not cam_id or cam_id in _halted_processors:
+                continue
+            if _restart_processor_safe(cam, dvr_config):
+                resumed += 1
+    finally:
+        db.close()
+        _processors_before_video_test = []
+    return resumed
+
+
+def _stop_processor(cam_id: str) -> None:
+    processor = active_processors.pop(cam_id, None)
+    if not processor:
+        return
+    processor.stop()
+    processor.join(timeout=2)
+
+
+def _find_camera_config(cam_id: str, db: Session) -> dict | None:
+    record = _get_config_record(db)
+    if not record or not record.config_data:
+        return None
+    for cam in record.config_data.get("cameras", []):
+        if cam.get("id") == cam_id:
+            return cam
+    return None
+
+
+def _processing_state(cam_id: str) -> str:
+    if cam_id in _halted_processors:
+        return _halted_processors[cam_id]
+    proc = active_processors.get(cam_id)
+    if proc is not None and proc.is_alive():
+        return "running"
+    return "stopped"
+
+
+def _halt_processor(cam_id: str, mode: str, *, cctvname: str | None = None) -> None:
+    if mode not in ("paused", "stopped"):
+        raise ValueError(f"invalid halt mode: {mode}")
+    _halted_processors[cam_id] = mode
+    _stop_processor(cam_id)
+    upsert_camera_status(
+        cam_id,
+        mode,
+        cctvname=cctvname,
+        message=f"Processing {mode} by user",
+        detail=None,
+    )
+    logger.info("Processor %s for camera %s", mode, cam_id)
+
+
+def _resume_processor(cam_id: str, db: Session) -> bool:
+    _halted_processors.pop(cam_id, None)
+    cam = _find_camera_config(cam_id, db)
+    if not cam:
+        return False
+    dvr_config = _get_dvr_config(db)
+    return _restart_processor_safe(cam, dvr_config, force=True)
+
+
+def _restart_processor_safe(cam: dict, dvr_config: dict, *, force: bool = False) -> bool:
+    cam_id = cam.get("id")
+    if not cam_id:
+        return False
+    if not force and cam_id in _halted_processors:
+        logger.info("Skipping restart for halted camera %s", cam_id)
+        return False
+    try:
+        _stop_processor(cam_id)
+        active_processors[cam_id] = _start_processor(cam, dvr_config)
+        _maybe_schedule_backfill(cam, dvr_config)
+        logger.info("Processor running for camera %s", cam_id)
+        return True
+    except Exception as exc:
+        logger.error("Failed to start processor %s: %s", cam_id, exc)
+        upsert_camera_status(
+            cam_id,
+            "error",
+            cctvname=cam.get("name"),
+            message="Processor failed to start",
+            detail=str(exc),
+        )
+        return False
+
+
+def _sync_active_processors(db: Optional[Session] = None) -> int:
+    """Restart configured cameras whose processor thread is missing or dead."""
+    if _suspended_for_preview or _video_test_session is not None:
+        return 0
+
+    own_db = db is None
+    if own_db:
+        db = SessionLocal()
+    restarted = 0
+    try:
+        record = _get_config_record(db)
+        if not record or not record.config_data:
+            return 0
+        cameras = record.config_data.get("cameras", [])
+        dvr_config = record.config_data.get("dvr", {})
+
+        for cam in cameras:
+            cam_id = cam.get("id")
+            if not cam_id:
+                continue
+            if cam_id in _halted_processors:
+                continue
+            proc = active_processors.get(cam_id)
+            if proc is not None and proc.is_alive():
+                continue
+            if _restart_processor_safe(cam, dvr_config):
+                restarted += 1
+    finally:
+        if own_db:
+            db.close()
+    return restarted
 
 
 def _maybe_schedule_backfill(cam: dict, dvr_config: dict):
@@ -138,13 +312,13 @@ def _resume_processors_after_dvr_preview():
 
     for cam in _suspended_for_preview:
         cam_id = cam.get("id")
-        if cam_id in active_processors:
+        if not cam_id or cam_id in active_processors:
             continue
-
+        if cam_id in _halted_processors:
+            continue
         logger.info("Resuming CCTV processor %s after DVR preview", cam_id)
         dvr_config = _get_dvr_config(SessionLocal())
-        processor = _start_processor(cam, dvr_config)
-        active_processors[cam_id] = processor
+        _restart_processor_safe(cam, dvr_config)
 
     _suspended_for_preview = []
 
@@ -152,6 +326,30 @@ def _resume_processors_after_dvr_preview():
 init_db()
 
 @asynccontextmanager
+def _restore_dvr_preview_session(db: Session):
+    """Re-connect HMI preview session from saved config after edge restart."""
+    dvr = _get_dvr_config(db)
+    ip = dvr.get("ip")
+    if not ip or ip == "demo":
+        return
+    username = dvr.get("username")
+    password = dvr.get("password")
+    if not username or not password:
+        return
+    try:
+        info = hikvision_preview.validate_and_connect(ip, username, password)
+        if info:
+            cameras = hikvision_preview.discover_cameras()
+            hikvision_preview.register_cameras(cameras)
+            logger.info(
+                "Restored DVR preview session for %s (%s channels)",
+                ip,
+                len(cameras),
+            )
+    except Exception as exc:
+        logger.warning("DVR preview restore on startup failed: %s", exc)
+
+
 async def lifespan(app: FastAPI):
     # Startup: Setup Background Scheduler
     scheduler = BackgroundScheduler()
@@ -185,10 +383,26 @@ async def lifespan(app: FastAPI):
 
     scheduler.add_job(
         peak_upload_job,
-        trigger=IntervalTrigger(seconds=20),
+        trigger=IntervalTrigger(seconds=60),
         id="peak_upload_thread",
         name="Peak Image Upload Thread",
         replace_existing=True
+    )
+
+    def processor_watchdog():
+        try:
+            n = _sync_active_processors()
+            if n:
+                logger.info("Processor watchdog restarted %s camera(s)", n)
+        except Exception as exc:
+            logger.warning("Processor watchdog failed: %s", exc)
+
+    scheduler.add_job(
+        processor_watchdog,
+        trigger=IntervalTrigger(seconds=30),
+        id="processor_watchdog",
+        name="Processor Watchdog",
+        replace_existing=True,
     )
     
     scheduler.start()
@@ -209,6 +423,7 @@ async def lifespan(app: FastAPI):
             logger.info(f"Started {len(active_processors)} CCTV Processors.")
             if cameras:
                 sync_configured_cameras(cameras, db=db)
+            _restore_dvr_preview_session(db)
     except Exception as e:
         logger.error(f"Failed to start CCTV Processors: {e}")
     finally:
@@ -283,6 +498,150 @@ def stream_cctv(cctv_id: str):
             raise HTTPException(status_code=404, detail="CCTV Processor not found or not active")
     return StreamingResponse(frame_generator(cctv_id), media_type="multipart/x-mixed-replace; boundary=frame")
 
+
+async def video_test_frame_generator():
+    while True:
+        session = _video_test_session
+        interval = 0.05
+        if session and session.running:
+            session.tick()
+            if session.last_frame:
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + session.last_frame + b"\r\n"
+                )
+            interval = session.get_stream_interval()
+        await asyncio.sleep(interval)
+
+
+@app.get("/test", tags=["Test"])
+def test_page_redirect():
+    """Video test UI — analytics on MP4, no DB."""
+    page = os.path.join(os.path.dirname(__file__), "static", "video_test.html")
+    if os.path.isfile(page):
+        return FileResponse(page)
+    raise HTTPException(status_code=404, detail="Test page missing")
+
+
+@app.post("/test/video/preview", tags=["Test"])
+def video_test_preview(req: schemas.VideoTestPreviewRequest):
+    """First frame for line drawing — no analytics, no DB."""
+    result = grab_first_frame(req.video_path)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Preview failed"))
+    return result
+
+
+@app.post("/test/video/zones", tags=["Test"])
+def video_test_zones(req: schemas.VideoTestZonesRequest):
+    """Preview auto-generated observation / count / ignore zones from a line."""
+    from cv_engine.counting.zone_generator import ZoneGenerator
+
+    lc = req.line_coords
+    line_len = (
+        (lc.get("x2", 0) - lc.get("x1", 0)) ** 2
+        + (lc.get("y2", 0) - lc.get("y1", 0)) ** 2
+    ) ** 0.5
+    if line_len < 10:
+        raise HTTPException(status_code=400, detail="Line too short")
+
+    try:
+        zones = ZoneGenerator.generate_from_line(
+            lc,
+            req.observation_offset_pixels,
+            req.count_zone_width_pixels,
+            req.ignore_offset_pixels,
+            frame_width=req.width,
+            frame_height=req.height,
+            entry_side=req.entry_side,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "observation": zones.observation,
+        "count": zones.count,
+        "ignore": zones.ignore,
+        "entry": zones.entry,
+        "buffer": zones.buffer,
+        "exit": zones.exit,
+    }
+
+
+@app.post("/test/video/start", tags=["Test"])
+def start_video_test(req: schemas.VideoTestStartRequest, db: Session = Depends(get_db)):
+    global _video_test_session
+    if not req.line_coords:
+        raise HTTPException(status_code=400, detail="Draw counting line first")
+
+    lc = req.line_coords
+    line_len = (
+        (lc.get("x2", 0) - lc.get("x1", 0)) ** 2
+        + (lc.get("y2", 0) - lc.get("y1", 0)) ** 2
+    ) ** 0.5
+    if line_len < 10:
+        raise HTTPException(status_code=400, detail="Counting line too short — drag a longer line")
+
+    if _video_test_session:
+        _video_test_session.stop()
+        _video_test_session = None
+
+    paused = _suspend_processors_for_video_test(db)
+    manual_zones = req.zones if req.zones else None
+    session = VideoTestSession(
+        video_path=req.video_path,
+        line_coords=req.line_coords,
+        camera_role=req.camera_role,
+        count_direction=req.count_direction,
+        entry_side=req.entry_side,
+        observation_offset_pixels=req.observation_offset_pixels,
+        count_zone_width_pixels=req.count_zone_width_pixels,
+        ignore_offset_pixels=req.ignore_offset_pixels,
+        head_conf_threshold=req.head_conf_threshold,
+        manual_zones=manual_zones,
+        cv_engine_config=req.cv_engine,
+    )
+    session.start()
+    if not session.running:
+        _resume_processors_after_video_test()
+        raise HTTPException(status_code=400, detail=session.stats.get("error", "Failed to start test"))
+
+    _video_test_session = session
+    return {
+        "success": True,
+        "video_path": session.video_path,
+        "no_db": True,
+        "live_processors_paused": paused,
+    }
+
+
+@app.post("/test/video/stop", tags=["Test"])
+def stop_video_test():
+    global _video_test_session
+    if _video_test_session:
+        _video_test_session.stop()
+        _video_test_session = None
+    resumed = _resume_processors_after_video_test()
+    return {"success": True, "live_processors_resumed": resumed}
+
+
+@app.get("/test/video/status", tags=["Test"])
+def video_test_status():
+    session = _video_test_session
+    if not session:
+        return {"running": False, "no_db": True}
+    return session.stats
+
+
+@app.get("/test/video/stream", tags=["Test"])
+def video_test_stream():
+    if not _video_test_session or not _video_test_session.running:
+        raise HTTPException(status_code=404, detail="No video test running")
+    return StreamingResponse(
+        video_test_frame_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -334,20 +693,16 @@ def update_cctv_config(config: schemas.CctvConfigCreate, db: Session = Depends(g
         global _suspended_for_preview
 
         hikvision_preview.stop_preview()
-        _suspended_for_preview = []
         dvr_config = config.config_data.get("dvr", {})
-        for cam in cameras:
+        for idx, cam in enumerate(cameras):
             cam_id = cam.get("id")
-            if cam_id in active_processors:
-                logger.info(f"Stopping active CCTV processor {cam_id} for configuration update...")
-                active_processors[cam_id].stop()
-                active_processors[cam_id].join(timeout=2)
-                del active_processors[cam_id]
-
-            logger.info(f"Restarting CCTV processor {cam_id} with updated configurations...")
-            processor = _start_processor(cam, dvr_config)
-            active_processors[cam_id] = processor
-            _maybe_schedule_backfill(cam, dvr_config)
+            if not cam_id:
+                continue
+            if idx > 0:
+                time.sleep(PROCESSOR_RESTART_STAGGER_SEC)
+            logger.info("Restarting CCTV processor %s with updated configurations", cam_id)
+            _restart_processor_safe(cam, dvr_config)
+        _suspended_for_preview = []
     except Exception as e:
         logger.error(f"Failed to dynamically apply updated configuration: {e}")
         
@@ -377,11 +732,115 @@ def get_total_counts(cctv_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/processor/{cctv_id}/status", response_model=schemas.ProcessorStatusResponse, tags=["Analytics"])
-def get_processor_status(cctv_id: str):
+def get_processor_status(cctv_id: str, db: Session = Depends(get_db)):
+    halted = _halted_processors.get(cctv_id)
+    if halted:
+        cam = _find_camera_config(cctv_id, db)
+        return {
+            "cctv_id": cctv_id,
+            "cctv_name": (cam or {}).get("name", cctv_id),
+            "source_type": (cam or {}).get("source_type", ""),
+            "processing_state": halted,
+        }
+
     processor = active_processors.get(cctv_id)
-    if not processor:
-        raise HTTPException(status_code=404, detail="CCTV Processor not found or not active")
-    return processor.get_status()
+    if not processor or not processor.is_alive():
+        _sync_active_processors(db)
+        processor = active_processors.get(cctv_id)
+
+    if processor and processor.is_alive():
+        data = processor.get_status()
+        data["processing_state"] = "running"
+        return data
+
+    cam = _find_camera_config(cctv_id, db)
+    if cam:
+        return {
+            "cctv_id": cctv_id,
+            "cctv_name": cam.get("name", cctv_id),
+            "source_type": cam.get("source_type", ""),
+            "processing_state": "stopped",
+        }
+    raise HTTPException(status_code=404, detail="CCTV Processor not found or not active")
+
+
+@app.post("/processor/{cctv_id}/pause", tags=["Analytics"])
+def pause_processor(cctv_id: str, db: Session = Depends(get_db)):
+    cam = _find_camera_config(cctv_id, db)
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camera not in configuration")
+    _halt_processor(cctv_id, "paused", cctvname=cam.get("name"))
+    return {"success": True, "cctv_id": cctv_id, "processing_state": "paused"}
+
+
+@app.post("/processor/{cctv_id}/stop", tags=["Analytics"])
+def stop_processor_route(cctv_id: str, db: Session = Depends(get_db)):
+    cam = _find_camera_config(cctv_id, db)
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camera not in configuration")
+    _halt_processor(cctv_id, "stopped", cctvname=cam.get("name"))
+    return {"success": True, "cctv_id": cctv_id, "processing_state": "stopped"}
+
+
+@app.post("/processor/{cctv_id}/resume", tags=["Analytics"])
+def resume_processor(cctv_id: str, db: Session = Depends(get_db)):
+    cam = _find_camera_config(cctv_id, db)
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camera not in configuration")
+    if not _resume_processor(cctv_id, db):
+        raise HTTPException(status_code=500, detail="Failed to resume processor")
+    return {"success": True, "cctv_id": cctv_id, "processing_state": "running"}
+
+
+@app.post("/processors/pause-all", tags=["Analytics"])
+def pause_all_processors(db: Session = Depends(get_db)):
+    record = _get_config_record(db)
+    if not record or not record.config_data:
+        return {"success": True, "paused": []}
+    paused = []
+    for cam in record.config_data.get("cameras", []):
+        cam_id = cam.get("id")
+        if not cam_id:
+            continue
+        _halt_processor(cam_id, "paused", cctvname=cam.get("name"))
+        paused.append(cam_id)
+    return {"success": True, "paused": paused}
+
+
+@app.post("/processors/resume-all", tags=["Analytics"])
+def resume_all_processors(db: Session = Depends(get_db)):
+    record = _get_config_record(db)
+    if not record or not record.config_data:
+        return {"success": True, "resumed": []}
+    dvr_config = record.config_data.get("dvr", {})
+    resumed = []
+    for cam in record.config_data.get("cameras", []):
+        cam_id = cam.get("id")
+        if not cam_id:
+            continue
+        _halted_processors.pop(cam_id, None)
+        if _restart_processor_safe(cam, dvr_config, force=True):
+            resumed.append(cam_id)
+    return {"success": True, "resumed": resumed}
+
+
+@app.delete(
+    "/processor/{cctv_id}/data",
+    response_model=schemas.ClearCameraDataResponse,
+    tags=["Analytics"],
+)
+def clear_processor_data(cctv_id: str, db: Session = Depends(get_db)):
+    """Delete footfall windows, peak snapshots, and processing cursor for one camera."""
+    cam = _find_camera_config(cctv_id, db)
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camera not in configuration")
+
+    result = clear_camera_data(cctv_id, db)
+    proc = active_processors.get(cctv_id)
+    if proc and proc.is_alive():
+        reset_live_processor_counters(proc)
+
+    return result
 
 
 @app.get("/processor/{cctv_id}/minute-peaks", tags=["Analytics"])
@@ -428,6 +887,7 @@ def get_processor_thumbnail(cctv_id: str):
 
 @app.get("/cameras/status", tags=["Analytics"])
 def get_cameras_status(db: Session = Depends(get_db)):
+    _sync_active_processors(db)
     rows = db.query(models.CameraStatus).all()
     return [
         {
@@ -436,6 +896,9 @@ def get_cameras_status(db: Session = Depends(get_db)):
             "status": r.status,
             "message": r.message,
             "detail": r.detail,
+            "processing_state": _processing_state(r.cctvid)
+            if r.cctvid != "_dvr"
+            else None,
             "updated_at": r.updated_at.isoformat() if r.updated_at else None,
         }
         for r in rows
@@ -467,7 +930,8 @@ def get_analytics_summary(db: Session = Depends(get_db)):
             "cctvname": cam.get("name"),
             "total_in": totals.total_in or 0 if totals else 0,
             "total_out": totals.total_out or 0 if totals else 0,
-            "processor_active": proc is not None,
+            "processor_active": proc is not None and proc.is_alive(),
+            "processing_state": _processing_state(cid),
             "status": st.status if st else "unknown",
             "message": st.message if st else None,
             "window_in": proc.ctr_in if proc else 0,
@@ -694,14 +1158,43 @@ def dvr_session_status():
     return hikvision_preview.get_session_status()
 
 
+@app.get("/dvr/snapshot/{channel_id}", tags=["DVR HMI"])
+def dvr_channel_snapshot(channel_id: str):
+    """One-off ISAPI JPEG for channel picker thumbnails (no preview session)."""
+    if channel_id == "demo":
+        demo_path = Path("sample.mp4")
+        if demo_path.is_file():
+            import cv2
+
+            cap = cv2.VideoCapture(str(demo_path))
+            ok, frame = cap.read()
+            cap.release()
+            if ok and frame is not None:
+                import cv2 as cv
+
+                ok_enc, buf = cv.imencode(".jpg", frame, [cv.IMWRITE_JPEG_QUALITY, 70])
+                if ok_enc:
+                    return Response(buf.tobytes(), media_type="image/jpeg")
+        raise HTTPException(status_code=404, detail="Demo snapshot unavailable")
+
+    if channel_id not in hikvision_preview.camera_store:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    snap_id = substream_channel_id(channel_id)
+    data = fetch_snapshot_bytes(snap_id, hikvision_preview.dvr_credentials)
+    if not data:
+        raise HTTPException(status_code=503, detail="Snapshot unavailable")
+    return Response(data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
 @app.get("/dvr/frame/{channel_id}", tags=["DVR HMI"])
 def dvr_preview_frame(channel_id: str):
     """Return latest cached JPEG for line-drawing UI (instant, no blocking)."""
     if channel_id not in hikvision_preview.camera_store and channel_id != "demo":
         raise HTTPException(status_code=404, detail="Camera not found")
 
-    hikvision_preview.ensure_preview(channel_id)
-
+    # Only serve frames from an active preview session started via /dvr/preview/start.
+    # Auto-starting here used to poll ISAPI alongside analytics and starve the DVR.
     frame_data = hikvision_preview.get_cached_frame(channel_id)
 
     if frame_data:

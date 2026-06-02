@@ -16,10 +16,11 @@ ENV/
 *.mp4
 *.avi
 *.mkv
-*.pt
 *.onnx
 weights/
 runs/
+models/*.pt
+!models/.gitkeep
 yolov8n.pt
 
 # IDEs and OS

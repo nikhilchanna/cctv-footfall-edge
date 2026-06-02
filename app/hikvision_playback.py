@@ -20,6 +20,7 @@ from ultralytics import YOLO
 
 from app.database import SessionLocal
 from app.hikvision_snapshot import fetch_snapshot_bytes
+from app.peak_bucket import PEAK_BUCKET_MINUTES, floor_peak_bucket, peak_bucket_folder
 from app.models import MinutePeakSnapshot, ProcessingCursor
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,7 @@ def upsert_minute_peak(
     captured_at: datetime,
     source: str,
 ) -> None:
+    minute_bucket = floor_peak_bucket(minute_bucket)
     existing = (
         db.query(MinutePeakSnapshot)
         .filter(
@@ -174,6 +176,7 @@ def upsert_minute_peak(
             existing.image_path = image_path
             existing.captured_at = captured_at
             existing.source = source
+            existing.uploaded_to_server = "Pending"
     else:
         db.add(
             MinutePeakSnapshot(
@@ -195,14 +198,14 @@ def backfill_missing_minutes(
     from_time: datetime,
     to_time: datetime,
 ) -> int:
-    """Backfill minute peak snapshots for [from_time, to_time). Returns minutes filled."""
+    """Backfill peak snapshots for [from_time, to_time). Returns buckets filled."""
     if from_time >= to_time:
         return 0
 
     os.makedirs("snapshots/peaks", exist_ok=True)
     filled = 0
-    cursor = from_time.replace(second=0, microsecond=0)
-    end = to_time.replace(second=0, microsecond=0)
+    cursor = floor_peak_bucket(from_time)
+    end = floor_peak_bucket(to_time)
 
     db: Session = SessionLocal()
     try:
@@ -216,9 +219,9 @@ def backfill_missing_minutes(
             db.commit()
 
         while cursor < end:
-            minute_end = cursor + timedelta(minutes=1)
+            bucket_end = cursor + timedelta(minutes=PEAK_BUCKET_MINUTES)
             playback_uri = search_recording_playback_uri(
-                credentials, channel_id, cursor, minute_end
+                credentials, channel_id, cursor, bucket_end
             )
 
             people_count = 0
@@ -229,7 +232,7 @@ def backfill_missing_minutes(
                 jpeg = download_playback_jpeg(credentials, playback_uri)
                 if jpeg:
                     people_count = count_people(jpeg)
-                    stamp = cursor.strftime("%Y%m%d%H%M")
+                    stamp = peak_bucket_folder(cursor)
                     image_path = f"snapshots/peaks/{cctvid}_{stamp}.jpg"
                     with open(image_path, "wb") as handle:
                         handle.write(jpeg)
@@ -239,7 +242,7 @@ def backfill_missing_minutes(
                 upsert_minute_peak(
                     db,
                     cctvid,
-                    cursor,
+                    floor_peak_bucket(cursor),
                     people_count,
                     image_path,
                     captured_at,
@@ -247,7 +250,7 @@ def backfill_missing_minutes(
                 )
                 db.commit()
 
-            cursor = minute_end
+            cursor = bucket_end
             time.sleep(BACKFILL_THROTTLE_SECONDS)
 
         if proc_cursor:
@@ -283,13 +286,13 @@ def schedule_backfill_if_needed(
                 return
 
             now = datetime.now(timezone.utc)
-            gap_start = cursor.last_processed_at.replace(second=0, microsecond=0)
-            gap_end = now.replace(second=0, microsecond=0)
-            if gap_end <= gap_start + timedelta(minutes=1):
+            gap_start = floor_peak_bucket(cursor.last_processed_at)
+            gap_end = floor_peak_bucket(now)
+            if gap_end <= gap_start:
                 return
 
             logger.info(
-                "Starting minute peak backfill for %s from %s to %s",
+                "Starting peak backfill for %s from %s to %s",
                 cctvid,
                 gap_start,
                 gap_end,
